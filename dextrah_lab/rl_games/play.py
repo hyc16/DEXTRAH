@@ -68,9 +68,17 @@ def main():
     clip_actions = agent_cfg["params"]["env"].get("clip_actions", math.inf)
 
     # create isaac environment
-    env = gym.make(args_cli.task, cfg=env_cfg)
+    # env = gym.make(args_cli.task, cfg=env_cfg)
+    # # wrap around environment for rl-games
+    # env = RlGamesVecEnvWrapper(env, rl_device, clip_obs, clip_actions)
+    # create isaac environment
+    raw_env = gym.make(args_cli.task, cfg=env_cfg)
+
+    # 关键：拿到真正的 task env（剥掉 gymnasium 的 OrderEnforcing / TimeLimit 等包装）
+    task_env = raw_env.unwrapped
+
     # wrap around environment for rl-games
-    env = RlGamesVecEnvWrapper(env, rl_device, clip_obs, clip_actions)
+    env = RlGamesVecEnvWrapper(raw_env, rl_device, clip_obs, clip_actions)
 
     # register the environment to rl-games registry
     # note: in agents configuration: environment name must be "rlgpu"
@@ -138,8 +146,11 @@ def main():
             actions = agent.get_action(obs, is_deterministic=False)
             # env stepping
             obs, _, dones, _ = env.step(actions)
-            print("count", count, "sr: ", env.env.in_success_region.float().mean())
-            sr[count] = env.env.in_success_region.float().mean()
+            # print("count", count, "sr: ", env.env.in_success_region.float().mean())
+            # sr[count] = env.env.in_success_region.float().mean()
+            sr_val = task_env.in_success_region.float().mean()
+            print("count", count, "sr:", sr_val.item())
+            sr[count] = sr_val
             count += 1
 
             # perform operations for terminated episodes

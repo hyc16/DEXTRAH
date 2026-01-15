@@ -114,7 +114,7 @@ class EventCfg:
 @configclass
 class DextrahKukaAllegroEnvCfg(DirectRLEnvCfg):
     # Placeholder for objects_dir which targets the directory of objects for training
-    objects_dir = "replace_me"
+    objects_dir = "visdex_objects"
     valid_objects_dir = ["visdex_objects"]
 
     # Toggle for using cuda graph
@@ -259,7 +259,7 @@ class DextrahKukaAllegroEnvCfg(DirectRLEnvCfg):
     camera_rand_rot_range = 3
     camera_rand_pos_range = 0.03
 
-    # horizontal fov: 48, vertical fov is h:w ratio
+    # horizontal fov: 48, vertical fov is h:w ratio固定相机设置
     horizontal_aperture = 21.02
     focal_length = 23.59
     img_width = int(160 * 2)
@@ -270,6 +270,22 @@ class DextrahKukaAllegroEnvCfg(DirectRLEnvCfg):
         data_types=["rgb", "depth"],
         spawn=sim_utils.PinholeCameraCfg(
             focal_length=focal_length, focus_distance=400.0, horizontal_aperture=horizontal_aperture, clipping_range=(0.01, 2.)
+        ),
+        width=img_width,
+        height=img_height,
+    )
+
+    #手上相机调试
+    hand_camera: TiledCameraCfg = TiledCameraCfg(
+        prim_path="/World/envs/env_.*/Robot/palm_link/HandCamera",
+        # 这里 offset 先给 0；真正绑定到手是在 env 里 set_world_poses 做的
+        offset=TiledCameraCfg.OffsetCfg(pos=(0.0, 0.0, 0.0), rot=(1.0, 0.0, 0.0, 0.0), convention="ros"),
+        data_types=["rgb", "depth"],
+        spawn=sim_utils.PinholeCameraCfg(
+            focal_length=6.0,
+            focus_distance=0.4,
+            horizontal_aperture=horizontal_aperture,
+            clipping_range=(0.01, 2.0),
         ),
         width=img_width,
         height=img_height,
@@ -434,7 +450,7 @@ class DextrahKukaAllegroEnvCfg(DirectRLEnvCfg):
     }
 
     # Action space related parameters
-    max_pose_angle = -1.
+    max_pose_angle = 45
 
     # depth randomization parameters
     img_aug_type = "rgb"

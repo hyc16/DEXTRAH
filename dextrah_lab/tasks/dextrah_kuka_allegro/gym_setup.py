@@ -10,6 +10,9 @@ from . import agents
 from .dextrah_kuka_allegro_env import DextrahKukaAllegroEnv
 from .dextrah_kuka_allegro_env_cfg import DextrahKukaAllegroEnvCfg
 
+# Direct vision (no distillation) env
+from .dextrah_kuka_allegro_direct_vision_env_cfg import DextrahKukaAllegroDirectVisionEnvCfg
+
 ##
 # Register Gym environments.
 ##
@@ -28,6 +31,16 @@ gym.register(
     },
 )
 
+gym.register(
+    id="Dextrah-Kuka-Allegro-DirectVision",
+    entry_point="dextrah_lab.tasks.dextrah_kuka_allegro.dextrah_kuka_allegro_direct_vision_env:DextrahKukaAllegroDirectVisionEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": DextrahKukaAllegroDirectVisionEnvCfg,
+        # 建议用能吃 "img"/"rgb" 的网络配置（你原蒸馏那套通常已经支持）
+        "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_ppo_lstm_cfg.yaml",
+    },
+)
 # The blacklist is used to prevent importing configs from sub-packages
 #_BLACKLIST_PKGS = ["utils"]
 # Import all configs in this package

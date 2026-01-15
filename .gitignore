@@ -3,6 +3,8 @@ __pycache__
 *.swp
 logs
 *.npy
+*.pt
+*.pth
 .thumbs/
 
 runs/

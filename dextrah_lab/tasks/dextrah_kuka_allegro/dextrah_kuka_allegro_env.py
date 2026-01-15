@@ -65,7 +65,10 @@ from fabrics_sim.utils.utils import initialize_warp, capture_fabric
 from fabrics_sim.worlds.world_mesh_model import WorldMeshesModel
 from fabrics_sim.utils.path_utils import get_robot_urdf_path
 from fabrics_sim.taskmaps.robot_frame_origins_taskmap import RobotFrameOriginsTaskMap
-
+# from ultralytics import FastSAM,SAM
+# import matplotlib.pyplot as plt
+# sam_encoder = FastSAM("FastSAM-s.pt")
+# sam_encoder = SAM("sam_b.pt")
 class DextrahKukaAllegroEnv(DirectRLEnv):
     cfg: DextrahKukaAllegroEnvCfg
 
@@ -135,7 +138,7 @@ class DextrahKukaAllegroEnv(DirectRLEnv):
         self.robot_start_joint_vel =\
             torch.zeros(self.num_envs, self.num_robot_dofs, device=self.device)
 
-        # Nominal finger curled config
+        # Nominal finger curled config 夹爪卷曲状态
         self.curled_q =\
             torch.tensor([0.0,  0.,  0.,  0., # NOTE: used to be 0.3 for last 3 joints
                           0.0,  0.,  0.,  0.,
@@ -416,7 +419,8 @@ class DextrahKukaAllegroEnv(DirectRLEnv):
         if self.cfg.distillation:
             self._tiled_camera = TiledCamera(self.cfg.tiled_camera)
             self.scene.sensors["tiled_camera"] = self._tiled_camera
-
+            self._hand_camera = TiledCamera(self.cfg.hand_camera)
+            self.scene.sensors["hand_camera"] = self._hand_camera
         # Determine obs sizes for policies and VF
         self._setup_policy_params()
 
@@ -690,9 +694,10 @@ class DextrahKukaAllegroEnv(DirectRLEnv):
         critic_obs = self.compute_critic_observations()
 
         if self.use_camera and not self.simulate_stereo:
+            #深度图处理，没有双摄像机直接用深度相机
             depth_map = self._tiled_camera.data.output["depth"].clone()
-            mask = depth_map.permute((0, 3, 1, 2)) > self.cfg.d_max
-            depth_map[depth_map <= 1e-8] = 10
+            mask = depth_map.permute((0, 3, 1, 2)) > self.cfg.d_max#太远的地方
+            depth_map[depth_map <= 1e-8] = 10#太近的地方
             depth_map[depth_map > self.cfg.d_max] = 0.
             depth_map[depth_map < self.cfg.d_min] = 0.
 
@@ -824,6 +829,21 @@ class DextrahKukaAllegroEnv(DirectRLEnv):
             obj_uv_left[:, 1] /= self.cfg.img_height
             obj_uv_right[:, 0] /= self.cfg.img_width
             obj_uv_right[:, 1] /= self.cfg.img_height
+
+            #SAMed image
+            img_l=left_rgb.permute((0, 3, 1, 2))
+            img_r=right_rgb.permute((0, 3, 1, 2))
+            imgs = torch.cat([img_l, img_r], dim=0)
+            imgs, (H0, W0), (pad_h, pad_w) = self.pad_to_stride(imgs, stride=32, mode="replicate")
+            # imgs = F.interpolate(imgs, size=(1024, 1024), mode="bilinear", align_corners=False)
+            #图像长宽必须被32整除
+            # samprocessed = sam_encoder(imgs, conf=0.6, iou=0.8,retina_masks=True)
+            # seg = self.fastsam_pure_seg_batch(samprocessed)
+            # seg = self.unpad_bchw(seg, (H0, W0))
+            # plt.figure()
+            # plt.imshow(seg[0].permute(1, 2, 0).detach().cpu().numpy())
+            # plt.axis("off")
+            # plt.show()
 
             aux_info = {
                 "object_pos": self.object_pos,
@@ -1442,11 +1462,13 @@ class DextrahKukaAllegroEnv(DirectRLEnv):
                 # robot
                 self.robot_dof_pos_noisy, # 0:23
                 self.robot_dof_vel_noisy, # 23:46
+                #手掌+四个手指的位置，由运动学推出
                 self.hand_pos_noisy, # 46:61
                 self.hand_vel_noisy, # 61:76
                 # object goal
                 self.object_goal, # 76:79
                 # last action
+                # 六自由度机械臂+灵巧手5维（灵巧手控制PCA降维）
                 self.actions, # 79:90
                 # fabric states
                 self.fabric_q_for_obs, # 90:113
@@ -1455,7 +1477,6 @@ class DextrahKukaAllegroEnv(DirectRLEnv):
             ),
             dim=-1,
         )
-
         return obs
 
     def compute_policy_observations(self):
@@ -1595,6 +1616,102 @@ class DextrahKukaAllegroEnv(DirectRLEnv):
 
         # Write wrench data to sim
         self.object.write_data_to_sim()
+
+        #padding图像
+
+    def pad_to_stride(self,x, stride=32, mode="replicate"):
+        # x: BCHW
+        b, c, h, w = x.shape
+        pad_h = (stride - h % stride) % stride
+        pad_w = (stride - w % stride) % stride
+        x_pad = F.pad(x, (0, pad_w, 0, pad_h), mode=mode)  # (left,right,top,bottom)
+        return x_pad, (h, w), (pad_h, pad_w)
+
+    def unpad_bchw(self,x, hw):
+        """x: [B,C,Hpad,Wpad] -> [B,C,H0,W0]"""
+        H0, W0 = hw
+        return x[..., :H0, :W0]
+
+    def unpad_hw(self,x, hw):
+        """x: [Hpad,Wpad] or [Hpad,Wpad,3] -> crop to [H0,W0,(...)]"""
+        H0, W0 = hw
+        return x[:H0, :W0, ...]
+
+    def fastsam_pure_seg_batch(self, results_list, orig_hw=None, background=(0, 0, 0), seed=0):
+        """
+        results_list: List[ultralytics.engine.results.Results], len=B
+        orig_hw: (H0,W0) 用于裁回原图大小（推荐传入）
+        return: seg_bhwc uint8, shape [B,H,W,3]
+        """
+        B = len(results_list)
+        if B == 0:
+            raise ValueError("Empty results_list")
+
+        # 以第一张的 device 为准（mask tensor 在 GPU 上）
+        device = None
+        for r in results_list:
+            if r.masks is not None and r.masks.data is not None:
+                device = r.masks.data.device
+                break
+        if device is None:
+            device = torch.device("cpu")
+
+        # 目标输出尺寸
+        if orig_hw is not None:
+            H, W = orig_hw
+        else:
+            H, W = results_list[0].orig_shape  # 注意：如果输入是 padded tensor，这里会是 padded 尺寸
+
+        seg = torch.zeros((B, H, W, 3), dtype=torch.uint8, device=device)
+        seg[..., 0] = background[0]
+        seg[..., 1] = background[1]
+        seg[..., 2] = background[2]
+
+        g = torch.Generator(device="cpu").manual_seed(seed)
+
+        for i, r in enumerate(results_list):
+            if r.masks is None or r.masks.data is None or r.masks.data.numel() == 0:
+                continue
+
+            m = (r.masks.data > 0)  # [N, Hpad, Wpad] bool
+            m = m[:, :H, :W]  # 裁回目标 H,W（去 pad）
+
+            N = m.shape[0]
+            # 每张图给 N 个实例生成颜色（在 CPU 上生成再搬到 device）
+            colors = torch.randint(0, 256, (N, 3), generator=g, dtype=torch.uint8).to(device)
+
+            # 按实例涂色：后面的实例覆盖前面的重叠区域
+            for k in range(N):
+                seg[i][m[k]] = colors[k]
+
+        seg_bchw = seg.permute(0, 3, 1, 2).contiguous()  # [B,3,H,W]
+        return seg_bchw
+
+    def fastsam_union_mask_b1hw(self,fastsam_model, imgs_bchw, conf=0.6, iou=0.8, imgsz=None):
+        """
+        imgs_bchw: [B,3,H,W] float in [0,1]
+        return: [B,1,H,W] float {0,1} (已裁掉pad)
+        """
+        B, _, H, W = imgs_bchw.shape
+
+        # pad
+        imgs_pad, (H0, W0), _ = self.pad_to_stride32(imgs_bchw, stride=32, mode="replicate")
+
+        # 推理
+        results = fastsam_model(imgs_pad, conf=conf, iou=iou, retina_masks=True, imgsz=imgsz)
+
+        # 组 mask
+        out = torch.zeros((B, 1, H0, W0), device=imgs_bchw.device, dtype=torch.float32)
+        for i, r in enumerate(results):
+            if r.masks is None:
+                continue
+            m = (r.masks.data > 0)  # [N,Hpad,Wpad]
+            m = m[:, :H0, :W0]  # 裁掉白边
+            union = m.any(dim=0)  # [H,W]
+            out[i, 0] = union.float()
+
+        return out
+
 
     @property
     @functools.lru_cache()

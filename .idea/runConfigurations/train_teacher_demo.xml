@@ -1,0 +1,27 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="train_teacher_demo" type="PythonConfigurationType" factoryName="Python">
+    <module name="DEXTRAH" />
+    <option name="ENV_FILES" value="" />
+    <option name="INTERPRETER_OPTIONS" value="" />
+    <option name="PARENT_ENVS" value="true" />
+    <envs>
+      <env name="PYTHONUNBUFFERED" value="1" />
+    </envs>
+    <option name="SDK_HOME" value="" />
+    <option name="SDK_NAME" value="$PROJECT_DIR$/../miniconda3/envs/isaaclab" />
+    <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$/dextrah_lab/rl_games" />
+    <option name="IS_MODULE_SDK" value="false" />
+    <option name="ADD_CONTENT_ROOTS" value="true" />
+    <option name="ADD_SOURCE_ROOTS" value="true" />
+    <EXTENSION ID="PythonCoverageRunConfigurationExtension" runner="coverage.py" />
+    <option name="RUN_TOOL" value="" />
+    <option name="SCRIPT_NAME" value="torch.distributed.run" />
+    <option name="PARAMETERS" value="--nnodes=1 --nproc_per_node=1 train.py --headless --task=Dextrah-Kuka-Allegro --seed -1 --distributed --num_envs 4096 agent.params.config.minibatch_size=16384 agent.params.config.central_value_config.minibatch_size=16384 agent.params.config.learning_rate=0.0001 agent.params.config.horizon_length=16 agent.params.config.mini_epochs=4 agent.params.config.multi_gpu=True agent.wandb_activate=False env.success_for_adr=0.4 env.objects_dir=visdex_objects env.adr_custom_cfg_dict.fabric_damping.gain=&quot;[10.0, 20.0]&quot; env.adr_custom_cfg_dict.reward_weights.finger_curl_reg=&quot;[-0.01, -0.01]&quot; env.adr_custom_cfg_dict.reward_weights.lift_weight=&quot;[5.0, 0.0]&quot; env.max_pose_angle=45.0 env.use_cuda_graph=True" />
+    <option name="SHOW_COMMAND_LINE" value="false" />
+    <option name="EMULATE_TERMINAL" value="false" />
+    <option name="MODULE_MODE" value="true" />
+    <option name="REDIRECT_INPUT" value="false" />
+    <option name="INPUT_FILE" value="" />
+    <method v="2" />
+  </configuration>
+</component>

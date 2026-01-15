@@ -144,7 +144,7 @@ def main(env_cfg, agent_cfg: dict):
     teacher_ckpt = None
     if not args_cli.play_policy:
         if args_cli.teacher is not None:
-            teacher_ckpt = os.path.join(parent_path, "pretrained_ckpts", args_cli.teacher)
+            teacher_ckpt = os.path.join(parent_path, args_cli.teacher)
         else:
             teacher_ckpt = os.path.join(parent_path, "pretrained_ckpts/new_teacher.pth")
     student_ckpt = None

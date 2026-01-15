@@ -1,0 +1,27 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="distill_student_demo" type="PythonConfigurationType" factoryName="Python">
+    <module name="DEXTRAH" />
+    <option name="ENV_FILES" value="" />
+    <option name="INTERPRETER_OPTIONS" value="" />
+    <option name="PARENT_ENVS" value="true" />
+    <envs>
+      <env name="PYTHONUNBUFFERED" value="1" />
+    </envs>
+    <option name="SDK_HOME" value="" />
+    <option name="SDK_NAME" value="$PROJECT_DIR$/../miniconda3/envs/isaaclab" />
+    <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$/dextrah_lab/distillation" />
+    <option name="IS_MODULE_SDK" value="false" />
+    <option name="ADD_CONTENT_ROOTS" value="true" />
+    <option name="ADD_SOURCE_ROOTS" value="true" />
+    <EXTENSION ID="PythonCoverageRunConfigurationExtension" runner="coverage.py" />
+    <option name="RUN_TOOL" value="" />
+    <option name="SCRIPT_NAME" value="torch.distributed.run" />
+    <option name="PARAMETERS" value="--nnodes=1 --nproc_per_node=1 run_distillation.py --headless --distributed --task=Dextrah-Kuka-Allegro --num_envs 64 env.distillation=True --enable_cameras env.simulate_stereo=False --teacher dextrah_lab/rl_games/logs/rl_games/dextrah_lstm/2026-01-08_16-27-56/nn/dextrah_lstm.pth --data_aug env.img_aug_type=&quot;rgb&quot; env.aux_coeff=10. env.objects_dir=&quot;visdex_objects&quot; env.max_pose_angle=45 env.adr_custom_cfg_dict.fabric_damping.gain=&quot;[10.0, 20.0]&quot; env.adr_custom_cfg_dict.reward_weights.finger_curl_reg=&quot;[-0.01, -0.01]&quot; env.adr_custom_cfg_dict.reward_weights.lift_weight=&quot;[5.0, 0.0]&quot; env.use_cuda_graph=True" />
+    <option name="SHOW_COMMAND_LINE" value="false" />
+    <option name="EMULATE_TERMINAL" value="false" />
+    <option name="MODULE_MODE" value="true" />
+    <option name="REDIRECT_INPUT" value="false" />
+    <option name="INPUT_FILE" value="" />
+    <method v="2" />
+  </configuration>
+</component>
