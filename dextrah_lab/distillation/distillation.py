@@ -160,7 +160,7 @@ class Dagger:
         #     num_cycles=self.num_cycles
         # )
         self.num_warmup_steps = 1000
-        self.num_iters = 100_000
+        self.num_iters = 200_000
 
         # load weights for student and teacher
         if self.config["student"]["ckpt"] is not None:

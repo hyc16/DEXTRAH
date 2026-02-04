@@ -245,16 +245,19 @@ class DextrahKukaAllegroEnvCfg(DirectRLEnvCfg):
     #     5.668315593050039097e-02, -9.970924792142141779e-01, -5.092747518000630136e-02, 4.559887081479024329e-01,
     #     0.000000000000000000e+00, 0.000000000000000000e+00, 0.000000000000000000e+00, 1.000000000000000000e+00
     # ]).reshape(4,4)
+    #
+    # tf = np.array([
+    #     7.416679444534866883e-02,-9.902696855667120213e-01,1.177507386359286923e-01,-7.236400044878017468e-01,
+    #     -1.274026398887237732e-01,1.076995435286611930e-01,9.859864987275952508e-01,-6.886495877727516479e-01,
+    #     -9.890742408692511090e-01,-8.812921292808308105e-02,-1.181752422362273985e-01,6.366771698474239516e-01,
+    #     0.000000000000000000e+00,0.000000000000000000e+00,0.000000000000000000e+00,1.000000000000000000e+00
+    # ]).reshape(4,4)
+    tf = np.ones((4,4))
 
-    tf = np.array([
-        7.416679444534866883e-02,-9.902696855667120213e-01,1.177507386359286923e-01,-7.236400044878017468e-01,
-        -1.274026398887237732e-01,1.076995435286611930e-01,9.859864987275952508e-01,-6.886495877727516479e-01,
-        -9.890742408692511090e-01,-8.812921292808308105e-02,-1.181752422362273985e-01,6.366771698474239516e-01,
-        0.000000000000000000e+00,0.000000000000000000e+00,0.000000000000000000e+00,1.000000000000000000e+00
-    ]).reshape(4,4)
     camera_pos = tf[:3, 3].tolist()
     # camera_rot = [0.6887834, -0.7242703, -0.0299371, -0.0106609]
-    camera_rot = [ 0.51567701, -0.52073085,  0.53658829,  0.41831759]
+    # camera_rot = [ 0.51567701, -0.52073085,  0.53658829,  0.41831759]
+    camera_rot = [1,0,0,0]
     del tf # this is hacky but it needs to be done because omega conf doesn't support np.ndarray as a primitive
     camera_rand_rot_range = 3
     camera_rand_pos_range = 0.03
@@ -264,20 +267,20 @@ class DextrahKukaAllegroEnvCfg(DirectRLEnvCfg):
     focal_length = 23.59
     img_width = int(160 * 2)
     img_height = int(120 * 2)
-    tiled_camera: TiledCameraCfg = TiledCameraCfg(
-        prim_path="/World/envs/env_.*/Camera",
-        offset=TiledCameraCfg.OffsetCfg(pos=camera_pos, rot=camera_rot, convention="ros"),
-        data_types=["rgb", "depth"],
-        spawn=sim_utils.PinholeCameraCfg(
-            focal_length=focal_length, focus_distance=400.0, horizontal_aperture=horizontal_aperture, clipping_range=(0.01, 2.)
-        ),
-        width=img_width,
-        height=img_height,
-    )
+    # tiled_camera: TiledCameraCfg = TiledCameraCfg(
+    #     prim_path="/World/envs/env_.*/Camera",
+    #     offset=TiledCameraCfg.OffsetCfg(pos=camera_pos, rot=camera_rot, convention="ros"),
+    #     data_types=["rgb", "depth"],
+    #     spawn=sim_utils.PinholeCameraCfg(
+    #         focal_length=focal_length, focus_distance=400.0, horizontal_aperture=horizontal_aperture, clipping_range=(0.01, 2.)
+    #     ),
+    #     width=img_width,
+    #     height=img_height,
+    # )
 
     #手上相机调试
-    hand_camera: TiledCameraCfg = TiledCameraCfg(
-        prim_path="/World/envs/env_.*/Robot/palm_link/HandCamera",
+    hand_left_camera: TiledCameraCfg = TiledCameraCfg(
+        prim_path="/World/envs/env_.*/Robot/palm_link/HandCameraLeft",
         # 这里 offset 先给 0；真正绑定到手是在 env 里 set_world_poses 做的
         offset=TiledCameraCfg.OffsetCfg(pos=(0.0, 0.0, 0.0), rot=(1.0, 0.0, 0.0, 0.0), convention="ros"),
         data_types=["rgb", "depth"],
@@ -290,7 +293,19 @@ class DextrahKukaAllegroEnvCfg(DirectRLEnvCfg):
         width=img_width,
         height=img_height,
     )
-
+    hand_right_camera: TiledCameraCfg = TiledCameraCfg(
+        prim_path="/World/envs/env_.*/Robot/palm_link/HandCameraRight",
+        offset=TiledCameraCfg.OffsetCfg(pos=(0.065, -0.062, 0.0),rot=(0.0, 0.0, 0.0, 1.0), convention="ros"),
+        data_types=["rgb", "depth"],
+        spawn=sim_utils.PinholeCameraCfg(
+            focal_length=6.0,
+            focus_distance=0.4,
+            horizontal_aperture=horizontal_aperture,
+            clipping_range=(0.01, 2.0),
+        ),
+        width=img_width,
+        height=img_height,
+    )
     fov = 2 * math.atan(horizontal_aperture / (2 * focal_length))
     focal_px = img_width * 0.5 / math.tan(fov / 2)
     a = focal_px

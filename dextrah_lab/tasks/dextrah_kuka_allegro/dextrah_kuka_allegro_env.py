@@ -226,12 +226,13 @@ class DextrahKukaAllegroEnv(DirectRLEnv):
         #     5.668315593050039097e-02, -9.970924792142141779e-01, -5.092747518000630136e-02, 4.559887081479024329e-01,
         #     0.000000000000000000e+00, 0.000000000000000000e+00, 0.000000000000000000e+00, 1.000000000000000000e+00
         # ]).reshape(4,4)
-        tf = np.array([
-            7.416679444534866883e-02,-9.902696855667120213e-01,1.177507386359286923e-01,-7.236400044878017468e-01,
-            -1.274026398887237732e-01,1.076995435286611930e-01,9.859864987275952508e-01,-6.886495877727516479e-01,
-            -9.890742408692511090e-01,-8.812921292808308105e-02,-1.181752422362273985e-01,6.366771698474239516e-01,
-            0.000000000000000000e+00,0.000000000000000000e+00,0.000000000000000000e+00,1.000000000000000000e+00
-        ]).reshape(4,4)
+        # tf = np.array([
+        #     7.416679444534866883e-02,-9.902696855667120213e-01,1.177507386359286923e-01,-7.236400044878017468e-01,
+        #     -1.274026398887237732e-01,1.076995435286611930e-01,9.859864987275952508e-01,-6.886495877727516479e-01,
+        #     -9.890742408692511090e-01,-8.812921292808308105e-02,-1.181752422362273985e-01,6.366771698474239516e-01,
+        #     0.000000000000000000e+00,0.000000000000000000e+00,0.000000000000000000e+00,1.000000000000000000e+00
+        # ]).reshape(4,4)
+        tf = np.ones((4,4))
         self.camera_pose = np.tile(
             tf, (self.num_envs, 1, 1)
         )
@@ -417,10 +418,10 @@ class DextrahKukaAllegroEnv(DirectRLEnv):
         light_cfg.func("/World/Light", light_cfg)
         # add cameras
         if self.cfg.distillation:
-            self._tiled_camera = TiledCamera(self.cfg.tiled_camera)
-            self.scene.sensors["tiled_camera"] = self._tiled_camera
-            self._hand_camera = TiledCamera(self.cfg.hand_camera)
-            self.scene.sensors["hand_camera"] = self._hand_camera
+            self._hand_left_camera = TiledCamera(self.cfg.hand_left_camera)
+            self.scene.sensors["hand_left_camera"] = self._hand_left_camera
+            self._hand_right_camera = TiledCamera(self.cfg.hand_right_camera)
+            self.scene.sensors["hand_right_camera"] = self._hand_right_camera
         # Determine obs sizes for policies and VF
         self._setup_policy_params()
 
@@ -720,101 +721,50 @@ class DextrahKukaAllegroEnv(DirectRLEnv):
                 "mask": mask
             }
         elif self.simulate_stereo:
-            left_rgb = self._tiled_camera.data.output["rgb"].clone() / 255.
-            left_depth = self._tiled_camera.data.output["depth"].clone()
+            left_rgb = self._hand_left_camera.data.output["rgb"].clone() / 255.
+            left_depth = self._hand_left_camera.data.output["depth"].clone()
             left_mask = left_depth > self.cfg.d_max*10
             left_depth[left_depth <= 1e-8] = 10
             left_depth[left_depth > self.cfg.d_max] = 0.
             left_depth[left_depth < self.cfg.d_min] = 0.
-            right_to_world = torch.from_numpy(
-                np.matmul(self.camera_pose, self.camera_right_pose)
-            ).to(self.device)
-            right_to_world_rot = torch.tensor(R.from_matrix(
-                right_to_world[:, :3, :3].cpu().numpy()
-            ).as_quat()[:, [3, 0, 1, 2]]).to(self.device)
-            self._tiled_camera.set_world_poses(
-                positions=right_to_world[:, :3, 3],
-                orientations=right_to_world_rot,
-                env_ids=self.robot._ALL_INDICES,
-                convention="ros"
-            )
             self.sim.render()
-            self._tiled_camera.update(0, force_recompute=True)
-            object_pos_world = torch.cat(
-                [
-                    self.object_pos,
-                    torch.ones(
-                        self.object_pos.shape[0], 1,
-                        device=self.device,
-                        dtype=right_to_world.dtype
-                    )
-                ], dim=-1
-            )
-            # (N, 4, 4)
-            T_right_world = torch.eye(4, device=self.device, dtype=right_to_world.dtype).unsqueeze(0).repeat(
-                self.num_envs, 1, 1
-            )
-            T_right_world[:, :3, :3] = right_to_world[:, :3, :3].transpose(1, 2)
-            T_right_world[:, :3, 3] = torch.bmm(
-                -T_right_world[:, :3, :3],
-                right_to_world[:, :3, 3:4] - self.scene.env_origins.unsqueeze(-1)
-            ).squeeze(-1)
-            obj_pos_right = torch.bmm(
-                T_right_world,
-                object_pos_world.unsqueeze(-1)
-            )[:, :3, :]
-            obj_uv_right = torch.matmul(
-                self.intrinsic_matrix,
-                obj_pos_right
-            ).squeeze(-1)
-            obj_uv_right[:, :2] /= obj_uv_right[:, 2:3]
-            # right image is flipped
-            obj_uv_right[:, 0] = self.cfg.img_width - obj_uv_right[:, 0]
-            obj_uv_right[:, 1] = self.cfg.img_height - obj_uv_right[:, 1]
-
+            self._hand_left_camera.update(0, force_recompute=True)
 
             # self.sim.render()
             # self._tiled_camera.update(0, force_recompute=True)
-            right_rgb = self._tiled_camera.data.output["rgb"].clone() / 255.
-            right_depth = self._tiled_camera.data.output["depth"].clone()
+            right_rgb = self._hand_right_camera.data.output["rgb"].clone() / 255.
+            right_depth = self._hand_right_camera.data.output["depth"].clone()
             right_mask = right_depth > self.cfg.d_max*10
             right_depth[right_depth <= 1e-8] = 10
             right_depth[right_depth > self.cfg.d_max] = 0.
             right_depth[right_depth < self.cfg.d_min] = 0.
-            self._tiled_camera.set_world_poses(
-                positions=self.left_pos,
-                orientations=self.left_rot,
-                env_ids=self.robot._ALL_INDICES,
-                convention="ros"
-            )
 
             object_pos_world = torch.cat(
-                [
-                    self.object_pos,
-                    torch.ones(
-                        self.object_pos.shape[0], 1,
-                        device=self.device,
-                        dtype=right_to_world.dtype
-                    )
-                ], dim=-1
+                [self.object_pos, torch.ones(self.object_pos.shape[0], 1, device=self.device, dtype=torch.float64)],
+                dim=-1
             )
-            T_left_world = torch.eye(4, device=self.device, dtype=right_to_world.dtype).unsqueeze(0).repeat(
-                self.num_envs, 1, 1
-            )
-            T_left_world[:, :3, :3] = torch.from_numpy(self.camera_pose[:, :3, :3]).to(self.device).transpose(1, 2)
-            T_left_world[:, :3, 3] = torch.bmm(
-                -T_left_world[:, :3, :3],
-                torch.from_numpy(self.camera_pose[:, :3, 3:4]).to(self.device) - self.scene.env_origins.unsqueeze(-1)
-            ).squeeze(-1)
-            obj_pos_left = torch.bmm(
-                T_left_world,
-                object_pos_world.unsqueeze(-1)
-            )[:, :3, :]
-            obj_uv_left = torch.matmul(
-                self.intrinsic_matrix,
-                obj_pos_left
-            ).squeeze(-1)
-            obj_uv_left[:, :2] /= obj_uv_left[:, 2:3]
+            camL_pos = self._hand_left_camera.data.pos_w.to(torch.float64)  # (N,3)
+            camL_quat = self._hand_left_camera.data.quat_w_world.to(torch.float64)  # (N,4)
+
+            camR_pos = self._hand_right_camera.data.pos_w.to(torch.float64)  # (N,3)
+            camR_quat = self._hand_right_camera.data.quat_w_world.to(torch.float64)  # (N,4)
+            # rotation matrices (N,3,3): world_from_cam (or cam orientation in world)
+            R_wL = self._quat_wxyz_to_rotmat(camL_quat)
+            R_wR = self._quat_wxyz_to_rotmat(camR_quat)
+
+            # build T_cam_from_world (world -> cam): R^T, -R^T*(t - env_origin)
+            env_o = self.scene.env_origins.to(torch.float64)  # (N,3)
+            T_L = torch.eye(4, device=self.device, dtype=torch.float64).unsqueeze(0).repeat(self.num_envs, 1, 1)
+            T_L[:, :3, :3] = R_wL.transpose(1, 2)
+            T_L[:, :3, 3] = torch.bmm(-T_L[:, :3, :3], (camL_pos - env_o).unsqueeze(-1)).squeeze(-1)
+
+            T_R = torch.eye(4, device=self.device, dtype=torch.float64).unsqueeze(0).repeat(self.num_envs, 1, 1)
+            T_R[:, :3, :3] = R_wR.transpose(1, 2)
+            T_R[:, :3, 3] = torch.bmm(-T_R[:, :3, :3], (camR_pos - env_o).unsqueeze(-1)).squeeze(-1)
+            # camera-frame 3D points
+            obj_pos_left = torch.bmm(T_L, object_pos_world.unsqueeze(-1))[:, :3, :]  # (N,3,1)
+            obj_pos_right = torch.bmm(T_R, object_pos_world.unsqueeze(-1))[:, :3, :]  # (N,3,1)
+
             # from PIL import Image
             # img_np_left = left_rgb.cpu().numpy()
             # img_np_right = right_rgb.cpu().numpy()
@@ -823,7 +773,13 @@ class DextrahKukaAllegroEnv(DirectRLEnv):
             student_policy_obs = self.compute_student_policy_observations()
             teacher_policy_obs = self.compute_policy_observations()
             critic_obs = self.compute_critic_observations()
+            # project with K
+            K = self.intrinsic_matrix.to(torch.float64)  # (3,3) or (N,3,3) depending on your cfg
+            obj_uv_left = torch.matmul(K, obj_pos_left).squeeze(-1)  # (N,3)
+            obj_uv_right = torch.matmul(K, obj_pos_right).squeeze(-1)  # (N,3)
 
+            obj_uv_left[:, :2] /= obj_uv_left[:, 2:3]
+            obj_uv_right[:, :2] /= obj_uv_right[:, 2:3]
             # normalize uvs by img dims
             obj_uv_left[:, 0] /= self.cfg.img_width
             obj_uv_left[:, 1] /= self.cfg.img_height
@@ -1150,55 +1106,7 @@ class DextrahKukaAllegroEnv(DirectRLEnv):
 
         # randomize camera position
         if self.use_camera:
-            rand_rots = np.random.uniform(
-                -self.cfg.camera_rand_rot_range,
-                self.cfg.camera_rand_rot_range,
-                size=(num_ids, 3)
-            )
-            new_rots = rand_rots + self.camera_rot_eul_orig
-            new_rots_quat = R.from_euler('xyz', new_rots, degrees=True).as_quat()
-            new_rots_quat = new_rots_quat[:, [3, 0, 1, 2]]
-            new_rots_quat = torch.tensor(new_rots_quat).to(self.device).float()
-            new_pos = self.camera_pos_orig + torch.empty(
-                num_ids, 3, device=self.device
-            ).uniform_(
-                -self.cfg.camera_rand_pos_range,
-                self.cfg.camera_rand_pos_range
-            )
             np_env_ids = env_ids.cpu().numpy()
-            self.camera_pose[np_env_ids, :3, :3] = R.from_euler(
-                'xyz', new_rots, degrees=True
-            ).as_matrix()
-            self.camera_pose[np_env_ids, :3, 3] = (
-                new_pos + self.scene.env_origins[env_ids]
-            ).cpu().numpy()
-            self.left_pos[env_ids] = new_pos + self.scene.env_origins[env_ids]
-            self.left_rot[env_ids] = new_rots_quat
-            self._tiled_camera.set_world_poses(
-                positions=new_pos + self.scene.env_origins[env_ids],
-                orientations=new_rots_quat,
-                env_ids=env_ids,
-                convention="ros"
-            )
-
-            rand_rots = np.random.uniform(
-                -2, 2, size=(num_ids, 3)
-            )
-            new_rots = rand_rots + self.camera_right_rot_eul_orig
-            new_rots_quat = R.from_euler('xyz', new_rots, degrees=True).as_quat()
-            new_rots_quat = new_rots_quat[:, [3, 0, 1, 2]]
-            new_rots_quat = torch.tensor(new_rots_quat).to(self.device).float() 
-            new_pos = self.camera_right_pos_orig + torch.empty(
-                num_ids, 3, device=self.device
-            ).uniform_(
-                -3e-3, 3e-3
-            )
-            self.camera_right_pose[np_env_ids, :3, :3] = R.from_euler(
-                'xyz', new_rots, degrees=True
-            ).as_matrix()
-            self.camera_right_pose[np_env_ids, :3, 3] = new_pos.cpu().numpy()
-
-
             if self.cfg.disable_dome_light_randomization:
                 dome_light_rand_ratio = 0.0
             else:
@@ -1712,6 +1620,24 @@ class DextrahKukaAllegroEnv(DirectRLEnv):
 
         return out
 
+    def _quat_wxyz_to_rotmat(self, q: torch.Tensor) -> torch.Tensor:
+        # q: (N,4) wxyz
+        w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+        ww, xx, yy, zz = w * w, x * x, y * y, z * z
+        wx, wy, wz = w * x, w * y, w * z
+        xy, xz, yz = x * y, x * z, y * z
+
+        R = torch.empty((q.shape[0], 3, 3), device=q.device, dtype=q.dtype)
+        R[:, 0, 0] = ww + xx - yy - zz
+        R[:, 0, 1] = 2 * (xy - wz)
+        R[:, 0, 2] = 2 * (xz + wy)
+        R[:, 1, 0] = 2 * (xy + wz)
+        R[:, 1, 1] = ww - xx + yy - zz
+        R[:, 1, 2] = 2 * (yz - wx)
+        R[:, 2, 0] = 2 * (xz - wy)
+        R[:, 2, 1] = 2 * (yz + wx)
+        R[:, 2, 2] = ww - xx - yy + zz
+        return R
 
     @property
     @functools.lru_cache()
