@@ -383,7 +383,7 @@ class DextrahFGPNode(Node):
         self._hand_points_lock = Lock()
 
 
-        max_pose_angle = 45.
+        max_pose_angle = 45.0
         PALM_POSE_MINS = PALM_POSE_MINS_FUNC(max_pose_angle)
         PALM_POSE_MAXS = PALM_POSE_MAXS_FUNC(max_pose_angle)
 

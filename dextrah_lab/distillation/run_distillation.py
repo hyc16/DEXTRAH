@@ -3,6 +3,9 @@
 import argparse
 import sys
 
+import os
+if "LOCAL_RANK" in os.environ:
+    os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["LOCAL_RANK"]
 from isaaclab.app import AppLauncher
 
 # add argparse arguments
@@ -23,7 +26,7 @@ parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy 
 parser.add_argument("--teacher", type=str, default=None, help="Teacher checkpoint to use")
 parser.add_argument("--play_policy", type=bool, default=False, help="Play a distilled policy.")
 parser.add_argument("--data_aug", action="store_true", default=False, help="Whether to use data augmentation for student")
-
+parser.add_argument("--student_ckpt", type=str, default=None, help="Student checkpoint to initialize from")
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
@@ -79,10 +82,19 @@ from dextrah_lab.distillation.a2c_mono_transformer import A2CBuilder as A2CMonoT
 @hydra_task_config(args_cli.task, "rl_games_cfg_entry_point")
 def main(env_cfg, agent_cfg: dict):
     """ Performs distillation. """
-    world_size = int(os.environ['WORLD_SIZE'])  # Total number of processes
-    rank = int(os.environ['RANK'])  # Global rank of this process
-    local_rank = int(os.environ['LOCAL_RANK']) # local rank of the process 
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))  # Total number of processes
+    rank = int(os.environ.get("RANK", "0"))  # Global rank of this process
+    if args_cli.distributed:
+        import torch
+        torch.cuda.set_device(0)
+        dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    # local_rank = int(os.environ['LOCAL_RANK']) # local rank of the process
+
+    # torch.cuda.set_device(local_rank)
+    # torch.cuda.set_device(0)
+    print(f"[rank{rank}] visible_gpus={os.environ.get('CUDA_VISIBLE_DEVICES')}, "
+          f"device_count={torch.cuda.device_count()}, current={torch.cuda.current_device()}")
+    # dist.init_process_group("nccl", rank=rank, world_size=world_size)
 
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
 
@@ -94,17 +106,17 @@ def main(env_cfg, agent_cfg: dict):
 
     if args_cli.distributed:
         agent_cfg["params"]["seed"] += app_launcher.global_rank
-        agent_cfg["params"]["config"]["device"] = f"cuda:{app_launcher.local_rank}"
-        agent_cfg["params"]["config"]["device_name"] = f"cuda:{app_launcher.local_rank}"
+        agent_cfg["params"]["config"]["device"] = "cuda:0"
+        agent_cfg["params"]["config"]["device_name"] = "cuda:0"
         agent_cfg["params"]["config"]["multi_gpu"] = True
         # update env config device
-        env_cfg.sim.device = f"cuda:{app_launcher.local_rank}"
+        env_cfg.sim.device = "cuda:0"
 
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
     ov_env = env.env
 
-    parent_path = str(pathlib.Path(__file__).parent.parent.parent.resolve())
+    parent_path = str(pathlib.Path(__file__).parent.resolve().parent.parent)
     agent_cfg_folder = "dextrah_lab/tasks/dextrah_kuka_allegro/agents"
 
     if ov_env.simulate_stereo:
@@ -132,23 +144,20 @@ def main(env_cfg, agent_cfg: dict):
     num_student_obs = ov_env.num_observations
     num_teacher_obs = ov_env.num_teacher_observations
     num_actions = ov_env.num_actions
-    student_ckpt = "pretrained_ckpts/student_1_flipped.pth"
-    student_ckpt = os.path.join(
-        parent_path,
-        student_ckpt
-    )
-    # depth
-    # student_ckpt = "/home/ritviks/workspace/git/dextrah_lab/dextrah_lab/distillation/runs/Dextrah-Kuka-Allegro_01-00-25-56/nn/dextrah_student_30000_iters.pth"
     # stereo rgb visdex
     # Determine teacher checkpoint path
     teacher_ckpt = None
     if not args_cli.play_policy:
         if args_cli.teacher is not None:
-            teacher_ckpt = os.path.join(parent_path, "pretrained_ckpts", args_cli.teacher)
+            teacher_ckpt = os.path.join(parent_path, args_cli.teacher)
         else:
             teacher_ckpt = os.path.join(parent_path, "pretrained_ckpts/new_teacher.pth")
     student_ckpt = None
-    # student_ckpt = "/home/ritviks/workspace/git/distillation_results/new_obj_prims_seed_12.pth"
+    if args_cli.student_ckpt:
+        student_ckpt = args_cli.student_ckpt
+        # 相对路径按 parent_path 拼
+        if not os.path.isabs(student_ckpt):
+            student_ckpt = os.path.join(parent_path, student_ckpt)
 
     if rank == 0:
         train_dir = "runs"

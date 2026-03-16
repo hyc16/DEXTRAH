@@ -114,7 +114,7 @@ class EventCfg:
 @configclass
 class DextrahKukaAllegroEnvCfg(DirectRLEnvCfg):
     # Placeholder for objects_dir which targets the directory of objects for training
-    objects_dir = "replace_me"
+    objects_dir = "visdex_objects"
     valid_objects_dir = ["visdex_objects"]
 
     # Toggle for using cuda graph
@@ -259,7 +259,7 @@ class DextrahKukaAllegroEnvCfg(DirectRLEnvCfg):
     camera_rand_rot_range = 3
     camera_rand_pos_range = 0.03
 
-    # horizontal fov: 48, vertical fov is h:w ratio
+    # horizontal fov: 48, vertical fov is h:w ratio固定相机设置
     horizontal_aperture = 21.02
     focal_length = 23.59
     img_width = int(160 * 2)
@@ -434,7 +434,7 @@ class DextrahKukaAllegroEnvCfg(DirectRLEnvCfg):
     }
 
     # Action space related parameters
-    max_pose_angle = -1.
+    max_pose_angle = 45.0
 
     # depth randomization parameters
     img_aug_type = "rgb"

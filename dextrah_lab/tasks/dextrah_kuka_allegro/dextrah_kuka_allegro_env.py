@@ -135,7 +135,7 @@ class DextrahKukaAllegroEnv(DirectRLEnv):
         self.robot_start_joint_vel =\
             torch.zeros(self.num_envs, self.num_robot_dofs, device=self.device)
 
-        # Nominal finger curled config
+        # Nominal finger curled config 夹爪卷曲状态
         self.curled_q =\
             torch.tensor([0.0,  0.,  0.,  0., # NOTE: used to be 0.3 for last 3 joints
                           0.0,  0.,  0.,  0.,
@@ -147,8 +147,8 @@ class DextrahKukaAllegroEnv(DirectRLEnv):
         self.dextrah_adr =\
             DextrahADR(self.event_manager, self.cfg.adr_cfg_dict, self.cfg.adr_custom_cfg_dict)
         self.step_since_last_dr_change = 0
-        if self.cfg.distillation:
-            self.cfg.starting_adr_increments = self.cfg.num_adr_increments
+        # if self.cfg.distillation:
+        #     self.cfg.starting_adr_increments = self.cfg.num_adr_increments
         self.dextrah_adr.set_num_increments(self.cfg.starting_adr_increments)
         self.local_adr_increment = torch.tensor(
             self.cfg.starting_adr_increments,
@@ -229,6 +229,7 @@ class DextrahKukaAllegroEnv(DirectRLEnv):
             -9.890742408692511090e-01,-8.812921292808308105e-02,-1.181752422362273985e-01,6.366771698474239516e-01,
             0.000000000000000000e+00,0.000000000000000000e+00,0.000000000000000000e+00,1.000000000000000000e+00
         ]).reshape(4,4)
+        # tf = np.ones((4,4))
         self.camera_pose = np.tile(
             tf, (self.num_envs, 1, 1)
         )
@@ -690,9 +691,10 @@ class DextrahKukaAllegroEnv(DirectRLEnv):
         critic_obs = self.compute_critic_observations()
 
         if self.use_camera and not self.simulate_stereo:
+            #深度图处理，没有双摄像机直接用深度相机
             depth_map = self._tiled_camera.data.output["depth"].clone()
-            mask = depth_map.permute((0, 3, 1, 2)) > self.cfg.d_max
-            depth_map[depth_map <= 1e-8] = 10
+            mask = depth_map.permute((0, 3, 1, 2)) > self.cfg.d_max#太远的地方
+            depth_map[depth_map <= 1e-8] = 10#太近的地方
             depth_map[depth_map > self.cfg.d_max] = 0.
             depth_map[depth_map < self.cfg.d_min] = 0.
 
@@ -826,19 +828,19 @@ class DextrahKukaAllegroEnv(DirectRLEnv):
             obj_uv_right[:, 1] /= self.cfg.img_height
 
             aux_info = {
-                "object_pos": self.object_pos,
-                "left_img_depth": left_depth.permute((0, 3, 1, 2)),
+                "object_pos": self.object_pos,#物体位置
+                "left_img_depth": left_depth.permute((0, 3, 1, 2)),#左相机深度图
                 "obj_uv_left": obj_uv_left[:, :2],
-                "obj_uv_right": obj_uv_right[:, :2],
+                "obj_uv_right": obj_uv_right[:, :2],#物体在左/右相机图像上的像素坐标
             }
 
             observations = {
                 "policy": student_policy_obs,
-                "depth_left": left_depth.permute((0, 3, 1, 2)),
-                "depth_right": right_depth.permute((0, 3, 1, 2)),
-                "mask_left": left_mask.permute((0, 3, 1, 2)),
+                "depth_left": left_depth.permute((0, 3, 1, 2)),#左相机深度图
+                "depth_right": right_depth.permute((0, 3, 1, 2)),#右相机深度图
+                "mask_left": left_mask.permute((0, 3, 1, 2)),#深度掩码图
                 "mask_right": right_mask.permute((0, 3, 1, 2)),
-                "img_left": left_rgb.permute((0, 3, 1, 2)),
+                "img_left": left_rgb.permute((0, 3, 1, 2)),#原始左右相机 RGB 图
                 "img_right": right_rgb.permute((0, 3, 1, 2)),
                 "expert_policy": teacher_policy_obs,
                 "critic": critic_obs,
@@ -1167,7 +1169,7 @@ class DextrahKukaAllegroEnv(DirectRLEnv):
             new_rots = rand_rots + self.camera_right_rot_eul_orig
             new_rots_quat = R.from_euler('xyz', new_rots, degrees=True).as_quat()
             new_rots_quat = new_rots_quat[:, [3, 0, 1, 2]]
-            new_rots_quat = torch.tensor(new_rots_quat).to(self.device).float() 
+            new_rots_quat = torch.tensor(new_rots_quat).to(self.device).float()
             new_pos = self.camera_right_pos_orig + torch.empty(
                 num_ids, 3, device=self.device
             ).uniform_(
@@ -1442,11 +1444,13 @@ class DextrahKukaAllegroEnv(DirectRLEnv):
                 # robot
                 self.robot_dof_pos_noisy, # 0:23
                 self.robot_dof_vel_noisy, # 23:46
+                #手掌+四个手指的位置，由运动学推出
                 self.hand_pos_noisy, # 46:61
                 self.hand_vel_noisy, # 61:76
                 # object goal
                 self.object_goal, # 76:79
                 # last action
+                # 六自由度机械臂+灵巧手5维（灵巧手控制PCA降维）
                 self.actions, # 79:90
                 # fabric states
                 self.fabric_q_for_obs, # 90:113
@@ -1455,7 +1459,6 @@ class DextrahKukaAllegroEnv(DirectRLEnv):
             ),
             dim=-1,
         )
-
         return obs
 
     def compute_policy_observations(self):

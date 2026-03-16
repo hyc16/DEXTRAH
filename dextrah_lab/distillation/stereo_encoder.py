@@ -113,9 +113,9 @@ class ResnetEncoder(nn.Module):
 
         self.train_resnet = train_resnet
 
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        torch.cuda.set_device(local_rank)
-        device = torch.device("cuda", local_rank)
+        # local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        # torch.cuda.set_device(local_rank)
+        # device = torch.device("cuda", local_rank)
 
         self.resnet18 = torchvision.models.resnet18(
             weights=torchvision.models.ResNet18_Weights.IMAGENET1K_V1
