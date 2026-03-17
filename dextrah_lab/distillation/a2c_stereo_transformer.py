@@ -408,7 +408,6 @@ class A2CBuilder(NetworkBuilder):
                 #     torch.cat([img_left, img_right], dim=0),
                 #     # finetune_backbone=obs_dict["finetune_backbone"]
                 # )
-
                 embeds = self.stereo_encoder(
                     torch.cat([img_left, img_right], dim=0),
                     # finetune_backbone=obs_dict["finetune_backbone"]

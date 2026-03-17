@@ -22,7 +22,7 @@ import torch.nn.functional as F
 from collections.abc import Sequence
 from scipy.spatial.transform import Rotation as R
 import random
-from pxr import Gf, UsdGeom, UsdShade, Sdf
+from pxr import Gf, UsdGeom, UsdShade, Sdf, Semantics
 
 import omni.usd
 import isaaclab.sim as sim_utils
@@ -65,10 +65,13 @@ from fabrics_sim.utils.utils import initialize_warp, capture_fabric
 from fabrics_sim.worlds.world_mesh_model import WorldMeshesModel
 from fabrics_sim.utils.path_utils import get_robot_urdf_path
 from fabrics_sim.taskmaps.robot_frame_origins_taskmap import RobotFrameOriginsTaskMap
-# from ultralytics import FastSAM,SAM
-# import matplotlib.pyplot as plt
-# sam_encoder = FastSAM("FastSAM-s.pt")
-# sam_encoder = SAM("sam_b.pt")
+
+from ultralytics.models.sam.predict import SAM2Predictor
+import matplotlib
+
+import cv2
+matplotlib.use("TkAgg")   # 或 "QtAgg"
+
 class DextrahKukaAllegroEnv(DirectRLEnv):
     cfg: DextrahKukaAllegroEnvCfg
 
@@ -226,13 +229,13 @@ class DextrahKukaAllegroEnv(DirectRLEnv):
         #     5.668315593050039097e-02, -9.970924792142141779e-01, -5.092747518000630136e-02, 4.559887081479024329e-01,
         #     0.000000000000000000e+00, 0.000000000000000000e+00, 0.000000000000000000e+00, 1.000000000000000000e+00
         # ]).reshape(4,4)
-        # tf = np.array([
-        #     7.416679444534866883e-02,-9.902696855667120213e-01,1.177507386359286923e-01,-7.236400044878017468e-01,
-        #     -1.274026398887237732e-01,1.076995435286611930e-01,9.859864987275952508e-01,-6.886495877727516479e-01,
-        #     -9.890742408692511090e-01,-8.812921292808308105e-02,-1.181752422362273985e-01,6.366771698474239516e-01,
-        #     0.000000000000000000e+00,0.000000000000000000e+00,0.000000000000000000e+00,1.000000000000000000e+00
-        # ]).reshape(4,4)
-        tf = np.ones((4,4))
+        tf = np.array([
+            7.416679444534866883e-02,-9.902696855667120213e-01,1.177507386359286923e-01,-7.236400044878017468e-01,
+            -1.274026398887237732e-01,1.076995435286611930e-01,9.859864987275952508e-01,-6.886495877727516479e-01,
+            -9.890742408692511090e-01,-8.812921292808308105e-02,-1.181752422362273985e-01,6.366771698474239516e-01,
+            0.000000000000000000e+00,0.000000000000000000e+00,0.000000000000000000e+00,1.000000000000000000e+00
+        ]).reshape(4,4)
+        # tf = np.ones((4,4))
         self.camera_pose = np.tile(
             tf, (self.num_envs, 1, 1)
         )
@@ -279,6 +282,187 @@ class DextrahKukaAllegroEnv(DirectRLEnv):
         friction_coeff = friction_coeff.repeat((self.num_envs, 1))
         #self.robot.write_joint_friction_to_sim(friction_coeff, self.actuated_dof_indices, None)
         self.robot.data.default_joint_friction_coeff = friction_coeff
+
+    # grid_sz:散点密度长宽
+    # margin：边缘距离，点不贴着边撒
+    # score_thresh：得分大于0.7才mask
+    # iou_thresh：去重阈值，删除重复mask，多点必然会有重复标定的物体
+
+    def _init_sam2_predictor(self):
+        if hasattr(self, "_sam2_predictor") and self._sam2_predictor is not None:
+            return
+
+        predictor = SAM2Predictor(overrides={
+            "model": "sam2.1_l.pt",
+            "device": str(self.device),
+            "imgsz": 1024,
+            "mode": "predict",
+            "task": "segment",
+        })
+
+        predictor.setup_model(model=None, verbose=False)
+        predictor.args.imgsz = 1024
+        predictor.imgsz = (1024, 1024)
+        predictor.setup_source(None)
+
+        self._sam2_predictor = predictor
+
+    def _get_im_features_batched(self, imgs_bchw: torch.Tensor):
+        """
+        imgs_bchw: [B, 3, 1024, 1024], float32, cuda
+        returns:
+            {
+                "image_embed": [B, 256, 64, 64],
+                "high_res_feats": [
+                    [B, 32, 256, 256],
+                    [B, 64, 128, 128]
+                ]
+            }
+        """
+        self._init_sam2_predictor()
+        predictor = self._sam2_predictor
+
+        with torch.inference_mode():
+            backbone_out = predictor.model.forward_image(imgs_bchw)
+            _, vision_feats, _, _ = predictor.model._prepare_backbone_features(backbone_out)
+
+            if predictor.model.directly_add_no_mem_embed:
+                vision_feats[-1] = vision_feats[-1] + predictor.model.no_mem_embed
+
+            B = imgs_bchw.shape[0]
+            feats = []
+
+            for feat, feat_size in zip(vision_feats, predictor._bb_feat_sizes):
+                h, w = feat_size
+                # feat: [H*W, B, C] -> [B, C, H, W]
+                feat_bchw = feat.permute(1, 2, 0).contiguous().reshape(B, feat.shape[-1], h, w)
+                feats.append(feat_bchw)
+
+            return {
+                "image_embed": feats[-1],
+                "high_res_feats": feats[:-1],
+            }
+
+    def _build_grid_prompts(self, size=1024, grid_size=5, margin=64):
+        """
+        返回:
+            points: [N, 1, 2]
+            labels: [N, 1]
+        """
+        xs = torch.linspace(margin, size - margin, grid_size, device=self.device)
+        ys = torch.linspace(margin, size - margin, grid_size, device=self.device)
+
+        pts = []
+        for y in ys:
+            for x in xs:
+                pts.append([x.item(), y.item()])
+
+        points = torch.tensor(pts, device=self.device, dtype=torch.float32).unsqueeze(1)  # [N,1,2]
+        labels = torch.ones((points.shape[0], 1), device=self.device, dtype=torch.int64)  # [N,1]
+        return points, labels
+
+    def _mask_iou(self, a: torch.Tensor, b: torch.Tensor):
+        """
+        a, b: bool tensor [H, W]
+        """
+        inter = (a & b).sum().float()
+        union = (a | b).sum().float()
+        if union.item() == 0:
+            return 0.0
+        return (inter / union).item()
+
+    def _auto_segment_one_image_from_features(self,features,img_idx: int,grid_points: torch.Tensor,grid_labels: torch.Tensor,score_thresh: float = 0.7,iou_thresh: float = 0.85,):
+        """
+        对 batch features 中的第 img_idx 张图做自动网格点分割
+        返回:
+            kept_masks: list[torch.Tensor(H,W)]  bool
+            kept_scores: list[float]
+        """
+        predictor = self._sam2_predictor
+        candidates = []
+
+        with torch.inference_mode():
+            for p, l in zip(grid_points, grid_labels):
+                # p: [1,2] -> [1,1,2]
+                points = p.unsqueeze(0)  # [1,1,2]
+                labels = l.unsqueeze(0)  # [1,1]
+
+                pred_masks, pred_scores = predictor._inference_features(
+                    features,
+                    points=points,
+                    labels=labels,
+                    masks=None,
+                    multimask_output=True,
+                    img_idx=img_idx,
+                )
+
+                # 只取这个点最好的一个候选 mask
+                best_idx = int(torch.argmax(pred_scores).item())
+                best_score = float(pred_scores[best_idx].item())
+
+                if best_score < score_thresh:
+                    continue
+
+                best_mask = pred_masks[best_idx] > 0  # [256,256] bool
+                candidates.append((best_mask, best_score))
+
+        # 按 score 从高到低排序
+        candidates.sort(key=lambda x: x[1], reverse=True)
+
+        kept_masks = []
+        kept_scores = []
+
+        for mask, score in candidates:
+            duplicated = False
+            for existing in kept_masks:
+                if self._mask_iou(mask, existing) > iou_thresh:
+                    duplicated = True
+                    break
+            if not duplicated:
+                kept_masks.append(mask)
+                kept_scores.append(score)
+
+        return kept_masks, kept_scores
+
+    def _auto_segment_batch(self, imgs_sam: torch.Tensor, grid_size=5, score_thresh=0.7, iou_thresh=0.85):
+        """
+        imgs_sam: [B, 3, 1024, 1024]
+        返回:
+            union_masks: [B, 256, 256] bool
+            all_kept_masks: list[list[Tensor]]
+            all_kept_scores: list[list[float]]
+        """
+        features = self._get_im_features_batched(imgs_sam)
+        grid_points, grid_labels = self._build_grid_prompts(size=1024, grid_size=grid_size, margin=64)
+
+        num_imgs = imgs_sam.shape[0]
+        union_masks = []
+        all_kept_masks = []
+        all_kept_scores = []
+
+        for img_idx in range(num_imgs):
+            kept_masks, kept_scores = self._auto_segment_one_image_from_features(
+                features,
+                img_idx=img_idx,
+                grid_points=grid_points,
+                grid_labels=grid_labels,
+                score_thresh=score_thresh,
+                iou_thresh=iou_thresh,
+            )
+
+            if len(kept_masks) == 0:
+                union_mask = torch.zeros((256, 256), device=self.device, dtype=torch.bool)
+            else:
+                union_mask = torch.zeros_like(kept_masks[0], dtype=torch.bool)
+                for m in kept_masks:
+                    union_mask |= m
+
+            union_masks.append(union_mask)
+            all_kept_masks.append(kept_masks)
+            all_kept_scores.append(kept_scores)
+
+        union_masks = torch.stack(union_masks, dim=0)  # [B,256,256]
+        return union_masks, all_kept_masks, all_kept_scores
 
     def find_num_unique_objects(self, objects_dir):
         module_path = os.path.dirname(__file__)
@@ -400,6 +584,16 @@ class DextrahKukaAllegroEnv(DirectRLEnv):
         pos = pos + self.scene.env_origins
         self.gt_pos_markers.visualize(pos, self.object_rot)
 
+    def _set_semantic_label(self, prim_path: str, label: str):
+        stage = omni.usd.get_context().get_stage()
+        prim = stage.GetPrimAtPath(prim_path)
+        if not prim.IsValid():
+            print(f"[semantic] invalid prim: {prim_path}")
+            return
+        api = Semantics.SemanticsAPI.Apply(prim, "Semantics")
+        api.CreateSemanticTypeAttr().Set("class")
+        api.CreateSemanticDataAttr().Set(label)
+
     def _setup_scene(self):
         # add robot, objects
         # TODO: add goal objects?
@@ -418,16 +612,20 @@ class DextrahKukaAllegroEnv(DirectRLEnv):
         light_cfg.func("/World/Light", light_cfg)
         # add cameras
         if self.cfg.distillation:
-            self._hand_left_camera = TiledCamera(self.cfg.hand_left_camera)
-            self.scene.sensors["hand_left_camera"] = self._hand_left_camera
-            self._hand_right_camera = TiledCamera(self.cfg.hand_right_camera)
-            self.scene.sensors["hand_right_camera"] = self._hand_right_camera
+            self._tiled_camera = TiledCamera(self.cfg.tiled_camera)
+            self.scene.sensors["tiled_camera"] = self._tiled_camera
+
         # Determine obs sizes for policies and VF
         self._setup_policy_params()
 
         # Create the objects for grasping
         # self._setup_metropolis_objects()
         self._setup_objects()
+        # semantic labels
+        for i in range(self.num_envs):
+            self._set_semantic_label(f"/World/envs/env_{i}/Robot", "robot")
+            self._set_semantic_label(f"/World/envs/env_{i}/table", "table")
+
         if self.cfg.distillation:
             import omni.replicator.core as rep
             rep.settings.set_render_rtx_realtime(antialiasing="DLAA")
@@ -583,6 +781,9 @@ class DextrahKukaAllegroEnv(DirectRLEnv):
             # add object to scene
             object_for_grasping = RigidObject(object_cfg)
 
+############ 给当前抓取物体打 semantic label
+            self._set_semantic_label(prim_path, "object")
+
             # remove baseLink
             set_prim_attribute_value(
                 prim_path=prim_path+"/baseLink",
@@ -721,50 +922,101 @@ class DextrahKukaAllegroEnv(DirectRLEnv):
                 "mask": mask
             }
         elif self.simulate_stereo:
-            left_rgb = self._hand_left_camera.data.output["rgb"].clone() / 255.
-            left_depth = self._hand_left_camera.data.output["depth"].clone()
+            left_rgb = self._tiled_camera.data.output["rgb"].clone() / 255.
+            left_depth = self._tiled_camera.data.output["depth"].clone()
             left_mask = left_depth > self.cfg.d_max*10
             left_depth[left_depth <= 1e-8] = 10
             left_depth[left_depth > self.cfg.d_max] = 0.
             left_depth[left_depth < self.cfg.d_min] = 0.
+            right_to_world = torch.from_numpy(
+                np.matmul(self.camera_pose, self.camera_right_pose)
+            ).to(self.device)
+            right_to_world_rot = torch.tensor(R.from_matrix(
+                right_to_world[:, :3, :3].cpu().numpy()
+            ).as_quat()[:, [3, 0, 1, 2]]).to(self.device)
+            self._tiled_camera.set_world_poses(
+                positions=right_to_world[:, :3, 3],
+                orientations=right_to_world_rot,
+                env_ids=self.robot._ALL_INDICES,
+                convention="ros"
+            )
             self.sim.render()
-            self._hand_left_camera.update(0, force_recompute=True)
+            self._tiled_camera.update(0, force_recompute=True)
+            object_pos_world = torch.cat(
+                [
+                    self.object_pos,
+                    torch.ones(
+                        self.object_pos.shape[0], 1,
+                        device=self.device,
+                        dtype=right_to_world.dtype
+                    )
+                ], dim=-1
+            )
+            # (N, 4, 4)
+            T_right_world = torch.eye(4, device=self.device, dtype=right_to_world.dtype).unsqueeze(0).repeat(
+                self.num_envs, 1, 1
+            )
+            T_right_world[:, :3, :3] = right_to_world[:, :3, :3].transpose(1, 2)
+            T_right_world[:, :3, 3] = torch.bmm(
+                -T_right_world[:, :3, :3],
+                right_to_world[:, :3, 3:4] - self.scene.env_origins.unsqueeze(-1)
+            ).squeeze(-1)
+            obj_pos_right = torch.bmm(
+                T_right_world,
+                object_pos_world.unsqueeze(-1)
+            )[:, :3, :]
+            obj_uv_right = torch.matmul(
+                self.intrinsic_matrix,
+                obj_pos_right
+            ).squeeze(-1)
+            obj_uv_right[:, :2] /= obj_uv_right[:, 2:3]
+            # right image is flipped
+            obj_uv_right[:, 0] = self.cfg.img_width - obj_uv_right[:, 0]
+            obj_uv_right[:, 1] = self.cfg.img_height - obj_uv_right[:, 1]
+
 
             # self.sim.render()
             # self._tiled_camera.update(0, force_recompute=True)
-            right_rgb = self._hand_right_camera.data.output["rgb"].clone() / 255.
-            right_depth = self._hand_right_camera.data.output["depth"].clone()
+            right_rgb = self._tiled_camera.data.output["rgb"].clone() / 255.
+            right_depth = self._tiled_camera.data.output["depth"].clone()
             right_mask = right_depth > self.cfg.d_max*10
             right_depth[right_depth <= 1e-8] = 10
             right_depth[right_depth > self.cfg.d_max] = 0.
             right_depth[right_depth < self.cfg.d_min] = 0.
+            self._tiled_camera.set_world_poses(
+                positions=self.left_pos,
+                orientations=self.left_rot,
+                env_ids=self.robot._ALL_INDICES,
+                convention="ros"
+            )
 
             object_pos_world = torch.cat(
-                [self.object_pos, torch.ones(self.object_pos.shape[0], 1, device=self.device, dtype=torch.float64)],
-                dim=-1
+                [
+                    self.object_pos,
+                    torch.ones(
+                        self.object_pos.shape[0], 1,
+                        device=self.device,
+                        dtype=right_to_world.dtype
+                    )
+                ], dim=-1
             )
-            camL_pos = self._hand_left_camera.data.pos_w.to(torch.float64)  # (N,3)
-            camL_quat = self._hand_left_camera.data.quat_w_world.to(torch.float64)  # (N,4)
-
-            camR_pos = self._hand_right_camera.data.pos_w.to(torch.float64)  # (N,3)
-            camR_quat = self._hand_right_camera.data.quat_w_world.to(torch.float64)  # (N,4)
-            # rotation matrices (N,3,3): world_from_cam (or cam orientation in world)
-            R_wL = self._quat_wxyz_to_rotmat(camL_quat)
-            R_wR = self._quat_wxyz_to_rotmat(camR_quat)
-
-            # build T_cam_from_world (world -> cam): R^T, -R^T*(t - env_origin)
-            env_o = self.scene.env_origins.to(torch.float64)  # (N,3)
-            T_L = torch.eye(4, device=self.device, dtype=torch.float64).unsqueeze(0).repeat(self.num_envs, 1, 1)
-            T_L[:, :3, :3] = R_wL.transpose(1, 2)
-            T_L[:, :3, 3] = torch.bmm(-T_L[:, :3, :3], (camL_pos - env_o).unsqueeze(-1)).squeeze(-1)
-
-            T_R = torch.eye(4, device=self.device, dtype=torch.float64).unsqueeze(0).repeat(self.num_envs, 1, 1)
-            T_R[:, :3, :3] = R_wR.transpose(1, 2)
-            T_R[:, :3, 3] = torch.bmm(-T_R[:, :3, :3], (camR_pos - env_o).unsqueeze(-1)).squeeze(-1)
-            # camera-frame 3D points
-            obj_pos_left = torch.bmm(T_L, object_pos_world.unsqueeze(-1))[:, :3, :]  # (N,3,1)
-            obj_pos_right = torch.bmm(T_R, object_pos_world.unsqueeze(-1))[:, :3, :]  # (N,3,1)
-
+            T_left_world = torch.eye(4, device=self.device, dtype=right_to_world.dtype).unsqueeze(0).repeat(
+                self.num_envs, 1, 1
+            )
+            T_left_world[:, :3, :3] = torch.from_numpy(self.camera_pose[:, :3, :3]).to(self.device).transpose(1, 2)
+            T_left_world[:, :3, 3] = torch.bmm(
+                -T_left_world[:, :3, :3],
+                torch.from_numpy(self.camera_pose[:, :3, 3:4]).to(self.device) - self.scene.env_origins.unsqueeze(-1)
+            ).squeeze(-1)
+            obj_pos_left = torch.bmm(
+                T_left_world,
+                object_pos_world.unsqueeze(-1)
+            )[:, :3, :]
+            obj_uv_left = torch.matmul(
+                self.intrinsic_matrix,
+                obj_pos_left
+            ).squeeze(-1)
+            obj_uv_left[:, :2] /= obj_uv_left[:, 2:3]
             # from PIL import Image
             # img_np_left = left_rgb.cpu().numpy()
             # img_np_right = right_rgb.cpu().numpy()
@@ -773,13 +1025,7 @@ class DextrahKukaAllegroEnv(DirectRLEnv):
             student_policy_obs = self.compute_student_policy_observations()
             teacher_policy_obs = self.compute_policy_observations()
             critic_obs = self.compute_critic_observations()
-            # project with K
-            K = self.intrinsic_matrix.to(torch.float64)  # (3,3) or (N,3,3) depending on your cfg
-            obj_uv_left = torch.matmul(K, obj_pos_left).squeeze(-1)  # (N,3)
-            obj_uv_right = torch.matmul(K, obj_pos_right).squeeze(-1)  # (N,3)
 
-            obj_uv_left[:, :2] /= obj_uv_left[:, 2:3]
-            obj_uv_right[:, :2] /= obj_uv_right[:, 2:3]
             # normalize uvs by img dims
             obj_uv_left[:, 0] /= self.cfg.img_width
             obj_uv_left[:, 1] /= self.cfg.img_height
@@ -787,35 +1033,95 @@ class DextrahKukaAllegroEnv(DirectRLEnv):
             obj_uv_right[:, 1] /= self.cfg.img_height
 
             #SAMed image
-            img_l=left_rgb.permute((0, 3, 1, 2))
-            img_r=right_rgb.permute((0, 3, 1, 2))
-            imgs = torch.cat([img_l, img_r], dim=0)
-            imgs, (H0, W0), (pad_h, pad_w) = self.pad_to_stride(imgs, stride=32, mode="replicate")
-            # imgs = F.interpolate(imgs, size=(1024, 1024), mode="bilinear", align_corners=False)
-            #图像长宽必须被32整除
-            # samprocessed = sam_encoder(imgs, conf=0.6, iou=0.8,retina_masks=True)
-            # seg = self.fastsam_pure_seg_batch(samprocessed)
-            # seg = self.unpad_bchw(seg, (H0, W0))
-            # plt.figure()
-            # plt.imshow(seg[0].permute(1, 2, 0).detach().cpu().numpy())
-            # plt.axis("off")
-            # plt.show()
+            # img_l = left_rgb.permute((0, 3, 1, 2)).contiguous()  # [B, 3, H, W]
+            # img_r = right_rgb.permute((0, 3, 1, 2)).contiguous()  # [B, 3, H, W]
+            # B, _, H_raw, W_raw = img_l.shape
+            #
+            # # 2B batch: all left + all right
+            # imgs = torch.cat([img_l, img_r], dim=0)  # [2B, 3, H, W]
+            #
+            # imgs_sam = F.interpolate(imgs, size=(1024, 1024), mode="bilinear", align_corners=False).contiguous()
+            #
+            # union_masks_256, all_kept_masks, all_kept_scores = self._auto_segment_batch(
+            #     imgs_sam,
+            #     grid_size=5,  # 你先试 8；想更密可以 10/12，但会更慢
+            #     score_thresh=0.7,
+            #     iou_thresh=0.85,
+            # )
+            #
+            # # 上采样回原图大小，只做 debug 可视化
+            # union_masks_up = F.interpolate(
+            #     union_masks_256.unsqueeze(1).float(),
+            #     size=(H_raw, W_raw),
+            #     mode="nearest",
+            # ).squeeze(1) > 0.5  # [2B, H, W] bool
+
+            # 每 5 步刷新一次
+            # 先看第 0 张左图
+            # rgb0 = img_l[0].permute(1, 2, 0).detach().cpu().numpy()  # [H,W,3]
+            # mask0 = union_masks_up[0].detach().cpu().numpy()  # [H,W]
+            # mask_vis = (mask0 > 0).astype(np.uint8) * 255
+            # grid_points, grid_labels = self._build_grid_prompts(size=1024, grid_size=5, margin=64)
+            # pts = grid_points.squeeze(1).detach().cpu().numpy()  # [N,2]
+            # scale_x = mask_vis.shape[1] / 1024.0
+            # scale_y = mask_vis.shape[0] / 1024.0
+            # for p in pts:
+            #     x = int(round(p[0] * scale_x))
+            #     y = int(round(p[1] * scale_y))
+            #     cv2.circle(mask_vis, (x, y), 4, (0, 255, 0), -1)
+            # overlay = rgb0.copy()
+            # mask_bool = mask0 > 0
+            # # 背景压暗，前景保持原亮度
+            # bg_scale = 0.25  # 可调：越小背景越暗，推荐 0.2 ~ 0.5
+            # overlay[~mask_bool] = overlay[~mask_bool] * bg_scale
+            # overlay = np.clip(overlay, 0.0, 1.0)
+            # # 红色叠加/透明度
+            # overlay[mask_bool, 0] = overlay[mask_bool, 0] * 0.6 + 0.4
+            # overlay[mask_bool, 1] = overlay[mask_bool, 1] * 0.6
+            # overlay[mask_bool, 2] = overlay[mask_bool, 2] * 0.6
+            # overlay = np.clip(overlay, 0.0, 1.0)
+            # vis_bgr = (overlay[..., ::-1] * 255).astype(np.uint8)
+            # cv2.imshow("SAM2 AutoSeg Debug", vis_bgr)
+            # cv2.imshow("SAM2 AutoSeg Debug", mask_vis)
+            # cv2.waitKey(1)
+
+            # seg = self._tiled_camera.data.output["semantic_segmentation"]  # colorized=True 时
+            # img = seg[0, ..., :3].cpu().numpy()  # RGB
+            # img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+            #
+            # cv2.imshow("semantic_segmentation", img_bgr)
+            # cv2.waitKey(1)
+
+            # mask_left = union_masks_up[:B].unsqueeze(1).float()  # [B,1,H,W]
+            # mask_right = union_masks_up[B:].unsqueeze(1).float()  # [B,1,H,W]
+            # seg_left = img_l.clone()
+            # seg_right = img_r.clone()
+            # seg_left[:, 0:1] = seg_left[:, 0:1] * (1.0 - mask_left) + (seg_left[:, 0:1] * 0.6 + 0.4) * mask_left
+            # seg_left[:, 1:2] = seg_left[:, 1:2] * (1.0 - mask_left) + (seg_left[:, 1:2] * 0.6) * mask_left
+            # seg_left[:, 2:3] = seg_left[:, 2:3] * (1.0 - mask_left) + (seg_left[:, 2:3] * 0.6) * mask_left
+            # seg_right[:, 0:1] = seg_right[:, 0:1] * (1.0 - mask_right) + (seg_right[:, 0:1] * 0.6 + 0.4) * mask_right
+            # seg_right[:, 1:2] = seg_right[:, 1:2] * (1.0 - mask_right) + (seg_right[:, 1:2] * 0.6) * mask_right
+            # seg_right[:, 2:3] = seg_right[:, 2:3] * (1.0 - mask_right) + (seg_right[:, 2:3] * 0.6) * mask_right
+            # seg_left = torch.clamp(seg_left, 0.0, 1.0)
+            # seg_right = torch.clamp(seg_right, 0.0, 1.0)
 
             aux_info = {
-                "object_pos": self.object_pos,
-                "left_img_depth": left_depth.permute((0, 3, 1, 2)),
+                "object_pos": self.object_pos,#物体位置
+                "left_img_depth": left_depth.permute((0, 3, 1, 2)),#左相机深度图
                 "obj_uv_left": obj_uv_left[:, :2],
-                "obj_uv_right": obj_uv_right[:, :2],
+                "obj_uv_right": obj_uv_right[:, :2],#物体在左/右相机图像上的像素坐标
             }
 
             observations = {
                 "policy": student_policy_obs,
-                "depth_left": left_depth.permute((0, 3, 1, 2)),
-                "depth_right": right_depth.permute((0, 3, 1, 2)),
-                "mask_left": left_mask.permute((0, 3, 1, 2)),
+                "depth_left": left_depth.permute((0, 3, 1, 2)),#左相机深度图
+                "depth_right": right_depth.permute((0, 3, 1, 2)),#右相机深度图
+                "mask_left": left_mask.permute((0, 3, 1, 2)),#深度掩码图
                 "mask_right": right_mask.permute((0, 3, 1, 2)),
                 "img_left": left_rgb.permute((0, 3, 1, 2)),
                 "img_right": right_rgb.permute((0, 3, 1, 2)),
+                # "img_left": seg_left,
+                # "img_right": seg_right,
                 "expert_policy": teacher_policy_obs,
                 "critic": critic_obs,
                 "aux_info": aux_info,
@@ -1106,7 +1412,55 @@ class DextrahKukaAllegroEnv(DirectRLEnv):
 
         # randomize camera position
         if self.use_camera:
+            rand_rots = np.random.uniform(
+                -self.cfg.camera_rand_rot_range,
+                self.cfg.camera_rand_rot_range,
+                size=(num_ids, 3)
+            )
+            new_rots = rand_rots + self.camera_rot_eul_orig
+            new_rots_quat = R.from_euler('xyz', new_rots, degrees=True).as_quat()
+            new_rots_quat = new_rots_quat[:, [3, 0, 1, 2]]
+            new_rots_quat = torch.tensor(new_rots_quat).to(self.device).float()
+            new_pos = self.camera_pos_orig + torch.empty(
+                num_ids, 3, device=self.device
+            ).uniform_(
+                -self.cfg.camera_rand_pos_range,
+                self.cfg.camera_rand_pos_range
+            )
             np_env_ids = env_ids.cpu().numpy()
+            self.camera_pose[np_env_ids, :3, :3] = R.from_euler(
+                'xyz', new_rots, degrees=True
+            ).as_matrix()
+            self.camera_pose[np_env_ids, :3, 3] = (
+                new_pos + self.scene.env_origins[env_ids]
+            ).cpu().numpy()
+            self.left_pos[env_ids] = new_pos + self.scene.env_origins[env_ids]
+            self.left_rot[env_ids] = new_rots_quat
+            self._tiled_camera.set_world_poses(
+                positions=new_pos + self.scene.env_origins[env_ids],
+                orientations=new_rots_quat,
+                env_ids=env_ids,
+                convention="ros"
+            )
+
+            rand_rots = np.random.uniform(
+                -2, 2, size=(num_ids, 3)
+            )
+            new_rots = rand_rots + self.camera_right_rot_eul_orig
+            new_rots_quat = R.from_euler('xyz', new_rots, degrees=True).as_quat()
+            new_rots_quat = new_rots_quat[:, [3, 0, 1, 2]]
+            new_rots_quat = torch.tensor(new_rots_quat).to(self.device).float()
+            new_pos = self.camera_right_pos_orig + torch.empty(
+                num_ids, 3, device=self.device
+            ).uniform_(
+                -3e-3, 3e-3
+            )
+            self.camera_right_pose[np_env_ids, :3, :3] = R.from_euler(
+                'xyz', new_rots, degrees=True
+            ).as_matrix()
+            self.camera_right_pose[np_env_ids, :3, 3] = new_pos.cpu().numpy()
+
+
             if self.cfg.disable_dome_light_randomization:
                 dome_light_rand_ratio = 0.0
             else:

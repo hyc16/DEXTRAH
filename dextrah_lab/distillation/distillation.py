@@ -160,7 +160,7 @@ class Dagger:
         #     num_cycles=self.num_cycles
         # )
         self.num_warmup_steps = 1000
-        self.num_iters = 200_000
+        self.num_iters = 100_000
 
         # load weights for student and teacher
         if self.config["student"]["ckpt"] is not None:
@@ -347,6 +347,15 @@ class Dagger:
                 (self.num_envs, 1, self.ov_env.cfg.img_height, self.ov_env.cfg.img_width)
             ).to(self.device)
 
+    def beta_schedule(self, step: int) -> float:
+        # 可调：前 warmup_steps 保持 1.0，然后线性退火到 0
+        warmup_steps = 15_000
+        anneal_steps = 50_000  # 从 warmup_end 开始，退火持续 anneal_steps
+        if step < warmup_steps:
+            return 1.0
+        t = min(max(step - warmup_steps, 0), anneal_steps)
+        return float(1.0 - t / anneal_steps)
+
     def distill(self):
         self.student_model.train()
         self.teacher_model.eval()
@@ -363,17 +372,7 @@ class Dagger:
         num_iters_since_beta_dec = 0
 
         while log_counter < num_iters:
-            if log_counter < 15_000:
-                beta = 1.
-            else:
-                beta = 0.
-                # if log_counter % 240 == 0 or num_iters_since_beta_dec > 1_000:
-                #     num_iters_since_beta_dec = 0
-                #     perf = self.ov_env.in_success_region.float().mean().cpu().numpy()
-                #     if perf > 0.2:
-                #         beta = max(beta - 0.05, 0.)
-                #         print(f"Changing beta to new value: {beta}")
-            beta = 0.
+            beta = self.beta_schedule(log_counter)
             if self.play_policy:
                 beta = 0. if self.step_student_actions else 1.
                 self.optimizer.param_groups[0]["lr"] = 0.0
@@ -550,10 +549,10 @@ class Dagger:
             if beta is None:
                 stepping_actions = actions_student["actions"] if self.step_student_actions else actions_teacher["actions"]
             else:
-                p = torch.rand(self.num_envs) > beta
+                p = torch.rand(self.num_envs,device=self.device)
                 stepping_actions = torch.zeros_like(actions_student["actions"])
-                student_inds = p > beta
-                teacher_inds = p <= beta
+                teacher_inds = p < beta
+                student_inds = ~teacher_inds
                 if torch.any(student_inds):
                     stepping_actions[student_inds] = actions_student["actions"][student_inds]
                 if torch.any(teacher_inds):
