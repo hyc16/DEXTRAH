@@ -445,7 +445,7 @@ class DextrahKukaAllegroEnvCfg(DirectRLEnvCfg):
     cam_matrix[1, 1] = 2.9947157
     cam_matrix[2, 3] = -1.
     cam_matrix[3, 2] = 1.e-3
-    d_min = 0.5
+    d_min = 0.0
     d_max = 1.3
     depth_randomization_cfg_dict = {
         # Dropout and random noise blob parameters

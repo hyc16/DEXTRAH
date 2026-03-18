@@ -153,8 +153,8 @@ class DextrahKukaAllegroEnv(DirectRLEnv):
         self.dextrah_adr =\
             DextrahADR(self.event_manager, self.cfg.adr_cfg_dict, self.cfg.adr_custom_cfg_dict)
         self.step_since_last_dr_change = 0
-        if self.cfg.distillation:
-            self.cfg.starting_adr_increments = self.cfg.num_adr_increments
+        # if self.cfg.distillation:
+        #     self.cfg.starting_adr_increments = self.cfg.num_adr_increments
         self.dextrah_adr.set_num_increments(self.cfg.starting_adr_increments)
         self.local_adr_increment = torch.tensor(
             self.cfg.starting_adr_increments,
@@ -1033,28 +1033,28 @@ class DextrahKukaAllegroEnv(DirectRLEnv):
             obj_uv_right[:, 1] /= self.cfg.img_height
 
             #SAMed image
-            # img_l = left_rgb.permute((0, 3, 1, 2)).contiguous()  # [B, 3, H, W]
-            # img_r = right_rgb.permute((0, 3, 1, 2)).contiguous()  # [B, 3, H, W]
-            # B, _, H_raw, W_raw = img_l.shape
-            #
-            # # 2B batch: all left + all right
-            # imgs = torch.cat([img_l, img_r], dim=0)  # [2B, 3, H, W]
-            #
-            # imgs_sam = F.interpolate(imgs, size=(1024, 1024), mode="bilinear", align_corners=False).contiguous()
-            #
-            # union_masks_256, all_kept_masks, all_kept_scores = self._auto_segment_batch(
-            #     imgs_sam,
-            #     grid_size=5,  # 你先试 8；想更密可以 10/12，但会更慢
-            #     score_thresh=0.7,
-            #     iou_thresh=0.85,
-            # )
-            #
-            # # 上采样回原图大小，只做 debug 可视化
-            # union_masks_up = F.interpolate(
-            #     union_masks_256.unsqueeze(1).float(),
-            #     size=(H_raw, W_raw),
-            #     mode="nearest",
-            # ).squeeze(1) > 0.5  # [2B, H, W] bool
+            img_l = left_rgb.permute((0, 3, 1, 2)).contiguous()  # [B, 3, H, W]
+            img_r = right_rgb.permute((0, 3, 1, 2)).contiguous()  # [B, 3, H, W]
+            B, _, H_raw, W_raw = img_l.shape
+
+            # 2B batch: all left + all right
+            imgs = torch.cat([img_l, img_r], dim=0)  # [2B, 3, H, W]
+
+            imgs_sam = F.interpolate(imgs, size=(1024, 1024), mode="bilinear", align_corners=False).contiguous()
+
+            union_masks_256, all_kept_masks, all_kept_scores = self._auto_segment_batch(
+                imgs_sam,
+                grid_size=5,  # 你先试 8；想更密可以 10/12，但会更慢
+                score_thresh=0.7,
+                iou_thresh=0.85,
+            )
+
+            # 上采样回原图大小，只做 debug 可视化
+            union_masks_up = F.interpolate(
+                union_masks_256.unsqueeze(1).float(),
+                size=(H_raw, W_raw),
+                mode="nearest",
+            ).squeeze(1) > 0.5  # [2B, H, W] bool
 
             # 每 5 步刷新一次
             # 先看第 0 张左图
@@ -1084,6 +1084,103 @@ class DextrahKukaAllegroEnv(DirectRLEnv):
             # cv2.imshow("SAM2 AutoSeg Debug", vis_bgr)
             # cv2.imshow("SAM2 AutoSeg Debug", mask_vis)
             # cv2.waitKey(1)
+###################
+            # depth_valid = (right_depth[0, ..., 0] > 0).detach().cpu().numpy().astype(np.uint8) * 255
+            # #补边，不然边界会得分很高
+            # pad = 1
+            # depth_valid_pad = cv2.copyMakeBorder(depth_valid,pad, pad, pad, pad,borderType=cv2.BORDER_CONSTANT,value=0)
+            # #在补边后的图上做距离变换
+            # dist_map_pad = cv2.distanceTransform(depth_valid_pad, cv2.DIST_L2, 5)
+            # # 再裁回原图大小
+            # dist_map = dist_map_pad[pad:-pad, pad:-pad]
+            # # 可视化
+            # if dist_map.max() > 0:#如果有有效像素
+            #     dist_vis = (dist_map / dist_map.max() * 255).astype(np.uint8)
+            # else:
+            #     dist_vis = np.zeros_like(depth_valid, dtype=np.uint8)
+            # # ========= 迭代取点 =========
+            # #取最高分点
+            # dist_for_pick = dist_map.copy()
+            # picked_points = []
+            #
+            # num_points = 25  # 你之后可改成配置项
+            # radius = 35  # 抑制半径，可调
+            # alpha = 0.8  # 最大衰减强度，可调，越大压得越狠
+            # H, W = dist_for_pick.shape # 最大点附近方形区域选取
+            #
+            # for _ in range(num_points):
+            #     # 如果已经没有有效分数了，就提前结束
+            #     if dist_for_pick.max() <= 0:
+            #         break
+            #     max_idx = np.argmax(dist_for_pick)#找到最大值，但是是展开后的一维索引，要操作变回二维坐标
+            #     y, x = np.unravel_index(max_idx, dist_for_pick.shape)
+            #     picked_points.append((x, y))
+            #     #在最大点附近做圆形软衰减,仅对圆形的外界矩形操作，节省内存
+            #
+            #     y0, y1 = max(0, y - radius), min(H, y + radius + 1)
+            #     x0, x1 = max(0, x - radius), min(W, x + radius + 1)
+            #     yy, xx = np.mgrid[y0:y1, x0:x1]  # 生成这个方块中的每个像素坐标位置，存到yyxx
+            #     d = np.sqrt((yy - y) ** 2 + (xx - x) ** 2)  # 计算欧式距离
+            #     # 圆形软衰减核：中心最大，边缘为0
+            #     penalty = alpha * np.clip(1.0 - d / radius, 0.0, 1.0)  #一个反比例的惩罚
+            #     valid_patch = (depth_valid[y0:y1, x0:x1] > 0).astype(np.float32)  #检查一下需要操作的区域是否都是合法像素
+            #     patch = dist_for_pick[y0:y1, x0:x1]
+            #     dist_for_pick[y0:y1, x0:x1] = patch * (1.0 - penalty * valid_patch)
+            #     dist_for_pick = np.clip(dist_for_pick, 0.0, None)
+            # if dist_for_pick.max() > 0:
+            #     dist_vis_after = (dist_for_pick / dist_for_pick.max() * 255).astype(np.uint8)
+            # else:
+            #     dist_vis_after = np.zeros_like(depth_valid, dtype=np.uint8)
+            # # 点-->sam prompt
+            # num_points = len(picked_points)
+            # if num_points > 0:
+            #     H0, W0 = depth_valid.shape
+            #     scale_x = 1024.0 / W0
+            #     scale_y = 1024.0 / H0
+            #     pts_1024 = []
+            #     for (x, y) in picked_points:
+            #         pts_1024.append([x * scale_x, y * scale_y])
+            #     grid_points = torch.tensor(
+            #         pts_1024,
+            #         device=self.device,
+            #         dtype=torch.float32
+            #     ).unsqueeze(1)  # [N,1,2]
+            #     grid_labels = torch.ones( # 置1,代表想要在这个点，置0代表不要这个点
+            #         (num_points, 1),
+            #         device=self.device,
+            #         dtype=torch.int64
+            #     )  # [N,1]
+            # img0_sam = imgs_sam[B:B+1]  # [1,3,1024,1024]
+            # features0 = self._get_im_features_batched(img0_sam)
+            # kept_masks, kept_scores = self._auto_segment_one_image_from_features(
+            #     features0,
+            #     img_idx=0,
+            #     grid_points=grid_points,
+            #     grid_labels=grid_labels,
+            #     score_thresh=0.7,
+            #     iou_thresh=0.85,
+            # )
+            #
+            # if len(kept_masks) == 0:
+            #     union_mask = torch.zeros((256, 256), device=self.device, dtype=torch.bool)
+            # else:
+            #     union_mask = torch.zeros_like(kept_masks[0], dtype=torch.bool)
+            #     for m in kept_masks:
+            #         union_mask |= m
+            #
+            # mask_vis = (union_mask.detach().cpu().numpy().astype(np.uint8) * 255)
+            # # 在灰度图上画黑点
+            # for (x, y) in picked_points:
+            #     cv2.circle(depth_valid, (x, y), 4, 0, -1)
+            #     cv2.circle(dist_vis, (x, y), 4, 0, -1)
+            #     cv2.circle(dist_vis_after, (x, y), 4, 0, -1)
+            # cv2.imshow("Depth Valid Mask", depth_valid)
+            # cv2.imshow("Depth Distance Map", dist_vis)
+            # cv2.imshow("Depth Distance Map After Suppression", dist_vis_after)
+            # cv2.imshow("SAM Mask From Depth Points", mask_vis)
+            #
+            # cv2.waitKey(1)
+
 
             # seg = self._tiled_camera.data.output["semantic_segmentation"]  # colorized=True 时
             # img = seg[0, ..., :3].cpu().numpy()  # RGB
@@ -1091,19 +1188,44 @@ class DextrahKukaAllegroEnv(DirectRLEnv):
             #
             # cv2.imshow("semantic_segmentation", img_bgr)
             # cv2.waitKey(1)
-
-            # mask_left = union_masks_up[:B].unsqueeze(1).float()  # [B,1,H,W]
-            # mask_right = union_masks_up[B:].unsqueeze(1).float()  # [B,1,H,W]
-            # seg_left = img_l.clone()
-            # seg_right = img_r.clone()
-            # seg_left[:, 0:1] = seg_left[:, 0:1] * (1.0 - mask_left) + (seg_left[:, 0:1] * 0.6 + 0.4) * mask_left
-            # seg_left[:, 1:2] = seg_left[:, 1:2] * (1.0 - mask_left) + (seg_left[:, 1:2] * 0.6) * mask_left
-            # seg_left[:, 2:3] = seg_left[:, 2:3] * (1.0 - mask_left) + (seg_left[:, 2:3] * 0.6) * mask_left
-            # seg_right[:, 0:1] = seg_right[:, 0:1] * (1.0 - mask_right) + (seg_right[:, 0:1] * 0.6 + 0.4) * mask_right
-            # seg_right[:, 1:2] = seg_right[:, 1:2] * (1.0 - mask_right) + (seg_right[:, 1:2] * 0.6) * mask_right
-            # seg_right[:, 2:3] = seg_right[:, 2:3] * (1.0 - mask_right) + (seg_right[:, 2:3] * 0.6) * mask_right
-            # seg_left = torch.clamp(seg_left, 0.0, 1.0)
-            # seg_right = torch.clamp(seg_right, 0.0, 1.0)
+            #################
+            # #sam的obs输入
+            mask_left = union_masks_up[:B].unsqueeze(1).float()  # [B,1,H,W]
+            mask_right = union_masks_up[B:].unsqueeze(1).float()  # [B,1,H,W]
+            seg_left = img_l.clone()
+            seg_right = img_r.clone()
+            seg_left[:, 0:1] = seg_left[:, 0:1] * (1.0 - mask_left) + (seg_left[:, 0:1] * 0.6 + 0.4) * mask_left
+            seg_left[:, 1:2] = seg_left[:, 1:2] * (1.0 - mask_left) + (seg_left[:, 1:2] * 0.6) * mask_left
+            seg_left[:, 2:3] = seg_left[:, 2:3] * (1.0 - mask_left) + (seg_left[:, 2:3] * 0.6) * mask_left
+            seg_right[:, 0:1] = seg_right[:, 0:1] * (1.0 - mask_right) + (seg_right[:, 0:1] * 0.6 + 0.4) * mask_right
+            seg_right[:, 1:2] = seg_right[:, 1:2] * (1.0 - mask_right) + (seg_right[:, 1:2] * 0.6) * mask_right
+            seg_right[:, 2:3] = seg_right[:, 2:3] * (1.0 - mask_right) + (seg_right[:, 2:3] * 0.6) * mask_right
+            seg_left = torch.clamp(seg_left, 0.0, 1.0)
+            seg_right = torch.clamp(seg_right, 0.0, 1.0)
+###cv.imshow play的obs
+            # # [B, 3, H, W] -> [B, H, W, 3]
+            # left_np = seg_left.detach().permute(0, 2, 3, 1).cpu().numpy()
+            # right_np = seg_right.detach().permute(0, 2, 3, 1).cpu().numpy()
+            #
+            # # [0,1] -> uint8
+            # left_np = (left_np * 255).astype(np.uint8)
+            # right_np = (right_np * 255).astype(np.uint8)
+            # left_np = np.ascontiguousarray(left_np[..., ::-1])
+            # right_np = np.ascontiguousarray(right_np[..., ::-1])
+            #
+            # num_show = min(left_np.shape[0], 4)
+            #
+            # for i in range(num_show):
+            #     pair = np.concatenate([left_np[i], right_np[i]], axis=1)  # 左右拼接
+            #     pair = np.ascontiguousarray(pair)
+            #     cv2.putText(pair, f"env {i} left", (10, 25),
+            #                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            #     w = left_np[i].shape[1]
+            #     cv2.putText(pair, f"right", (w + 10, 25),
+            #                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            #     cv2.imshow(f"seg_env_{i}", pair)
+            #
+            # cv2.waitKey(1)
 
             aux_info = {
                 "object_pos": self.object_pos,#物体位置
@@ -1118,10 +1240,10 @@ class DextrahKukaAllegroEnv(DirectRLEnv):
                 "depth_right": right_depth.permute((0, 3, 1, 2)),#右相机深度图
                 "mask_left": left_mask.permute((0, 3, 1, 2)),#深度掩码图
                 "mask_right": right_mask.permute((0, 3, 1, 2)),
-                "img_left": left_rgb.permute((0, 3, 1, 2)),
-                "img_right": right_rgb.permute((0, 3, 1, 2)),
-                # "img_left": seg_left,
-                # "img_right": seg_right,
+                # "img_left": left_rgb.permute((0, 3, 1, 2)),
+                # "img_right": right_rgb.permute((0, 3, 1, 2)),
+                "img_left": seg_left,
+                "img_right": seg_right,
                 "expert_policy": teacher_policy_obs,
                 "critic": critic_obs,
                 "aux_info": aux_info,
