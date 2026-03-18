@@ -1032,31 +1032,30 @@ class DextrahKukaAllegroEnv(DirectRLEnv):
             obj_uv_right[:, 0] /= self.cfg.img_width
             obj_uv_right[:, 1] /= self.cfg.img_height
 
-            #SAMed image
-            img_l = left_rgb.permute((0, 3, 1, 2)).contiguous()  # [B, 3, H, W]
-            img_r = right_rgb.permute((0, 3, 1, 2)).contiguous()  # [B, 3, H, W]
-            B, _, H_raw, W_raw = img_l.shape
-
-            # 2B batch: all left + all right
-            imgs = torch.cat([img_l, img_r], dim=0)  # [2B, 3, H, W]
-
-            imgs_sam = F.interpolate(imgs, size=(1024, 1024), mode="bilinear", align_corners=False).contiguous()
-
-            union_masks_256, all_kept_masks, all_kept_scores = self._auto_segment_batch(
-                imgs_sam,
-                grid_size=5,  # 你先试 8；想更密可以 10/12，但会更慢
-                score_thresh=0.7,
-                iou_thresh=0.85,
-            )
-
-            # 上采样回原图大小，只做 debug 可视化
-            union_masks_up = F.interpolate(
-                union_masks_256.unsqueeze(1).float(),
-                size=(H_raw, W_raw),
-                mode="nearest",
-            ).squeeze(1) > 0.5  # [2B, H, W] bool
-
-            # 每 5 步刷新一次
+###############SAMed image，sam操作
+            # img_l = left_rgb.permute((0, 3, 1, 2)).contiguous()  # [B, 3, H, W]
+            # img_r = right_rgb.permute((0, 3, 1, 2)).contiguous()  # [B, 3, H, W]
+            # B, _, H_raw, W_raw = img_l.shape
+            #
+            # # 2B batch: all left + all right
+            # imgs = torch.cat([img_l, img_r], dim=0)  # [2B, 3, H, W]
+            #
+            # imgs_sam = F.interpolate(imgs, size=(1024, 1024), mode="bilinear", align_corners=False).contiguous()
+            #
+            # union_masks_256, all_kept_masks, all_kept_scores = self._auto_segment_batch(
+            #     imgs_sam,
+            #     grid_size=5,  # 你先试 8；想更密可以 10/12，但会更慢
+            #     score_thresh=0.7,
+            #     iou_thresh=0.85,
+            # )
+            #
+            # # 上采样回原图大小，只做 debug 可视化
+            # union_masks_up = F.interpolate(
+            #     union_masks_256.unsqueeze(1).float(),
+            #     size=(H_raw, W_raw),
+            #     mode="nearest",
+            # ).squeeze(1) > 0.5  # [2B, H, W] bool
+############mask叠加过程
             # 先看第 0 张左图
             # rgb0 = img_l[0].permute(1, 2, 0).detach().cpu().numpy()  # [H,W,3]
             # mask0 = union_masks_up[0].detach().cpu().numpy()  # [H,W]
@@ -1084,7 +1083,7 @@ class DextrahKukaAllegroEnv(DirectRLEnv):
             # cv2.imshow("SAM2 AutoSeg Debug", vis_bgr)
             # cv2.imshow("SAM2 AutoSeg Debug", mask_vis)
             # cv2.waitKey(1)
-###################
+############由深度图滤波的有效像素内，撒点+sam，调试成功
             # depth_valid = (right_depth[0, ..., 0] > 0).detach().cpu().numpy().astype(np.uint8) * 255
             # #补边，不然边界会得分很高
             # pad = 1
@@ -1178,10 +1177,8 @@ class DextrahKukaAllegroEnv(DirectRLEnv):
             # cv2.imshow("Depth Distance Map", dist_vis)
             # cv2.imshow("Depth Distance Map After Suppression", dist_vis_after)
             # cv2.imshow("SAM Mask From Depth Points", mask_vis)
-            #
             # cv2.waitKey(1)
-
-
+####看lab的分割图像
             # seg = self._tiled_camera.data.output["semantic_segmentation"]  # colorized=True 时
             # img = seg[0, ..., :3].cpu().numpy()  # RGB
             # img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
@@ -1189,19 +1186,19 @@ class DextrahKukaAllegroEnv(DirectRLEnv):
             # cv2.imshow("semantic_segmentation", img_bgr)
             # cv2.waitKey(1)
             #################
-            # #sam的obs输入
-            mask_left = union_masks_up[:B].unsqueeze(1).float()  # [B,1,H,W]
-            mask_right = union_masks_up[B:].unsqueeze(1).float()  # [B,1,H,W]
-            seg_left = img_l.clone()
-            seg_right = img_r.clone()
-            seg_left[:, 0:1] = seg_left[:, 0:1] * (1.0 - mask_left) + (seg_left[:, 0:1] * 0.6 + 0.4) * mask_left
-            seg_left[:, 1:2] = seg_left[:, 1:2] * (1.0 - mask_left) + (seg_left[:, 1:2] * 0.6) * mask_left
-            seg_left[:, 2:3] = seg_left[:, 2:3] * (1.0 - mask_left) + (seg_left[:, 2:3] * 0.6) * mask_left
-            seg_right[:, 0:1] = seg_right[:, 0:1] * (1.0 - mask_right) + (seg_right[:, 0:1] * 0.6 + 0.4) * mask_right
-            seg_right[:, 1:2] = seg_right[:, 1:2] * (1.0 - mask_right) + (seg_right[:, 1:2] * 0.6) * mask_right
-            seg_right[:, 2:3] = seg_right[:, 2:3] * (1.0 - mask_right) + (seg_right[:, 2:3] * 0.6) * mask_right
-            seg_left = torch.clamp(seg_left, 0.0, 1.0)
-            seg_right = torch.clamp(seg_right, 0.0, 1.0)
+###sam的obs输入
+            # mask_left = union_masks_up[:B].unsqueeze(1).float()  # [B,1,H,W]
+            # mask_right = union_masks_up[B:].unsqueeze(1).float()  # [B,1,H,W]
+            # seg_left = img_l.clone()
+            # seg_right = img_r.clone()
+            # seg_left[:, 0:1] = seg_left[:, 0:1] * (1.0 - mask_left) + (seg_left[:, 0:1] * 0.6 + 0.4) * mask_left
+            # seg_left[:, 1:2] = seg_left[:, 1:2] * (1.0 - mask_left) + (seg_left[:, 1:2] * 0.6) * mask_left
+            # seg_left[:, 2:3] = seg_left[:, 2:3] * (1.0 - mask_left) + (seg_left[:, 2:3] * 0.6) * mask_left
+            # seg_right[:, 0:1] = seg_right[:, 0:1] * (1.0 - mask_right) + (seg_right[:, 0:1] * 0.6 + 0.4) * mask_right
+            # seg_right[:, 1:2] = seg_right[:, 1:2] * (1.0 - mask_right) + (seg_right[:, 1:2] * 0.6) * mask_right
+            # seg_right[:, 2:3] = seg_right[:, 2:3] * (1.0 - mask_right) + (seg_right[:, 2:3] * 0.6) * mask_right
+            # seg_left = torch.clamp(seg_left, 0.0, 1.0)
+            # seg_right = torch.clamp(seg_right, 0.0, 1.0)
 ###cv.imshow play的obs
             # # [B, 3, H, W] -> [B, H, W, 3]
             # left_np = seg_left.detach().permute(0, 2, 3, 1).cpu().numpy()
@@ -1240,10 +1237,10 @@ class DextrahKukaAllegroEnv(DirectRLEnv):
                 "depth_right": right_depth.permute((0, 3, 1, 2)),#右相机深度图
                 "mask_left": left_mask.permute((0, 3, 1, 2)),#深度掩码图
                 "mask_right": right_mask.permute((0, 3, 1, 2)),
-                # "img_left": left_rgb.permute((0, 3, 1, 2)),
-                # "img_right": right_rgb.permute((0, 3, 1, 2)),
-                "img_left": seg_left,
-                "img_right": seg_right,
+                "img_left": left_rgb.permute((0, 3, 1, 2)),
+                "img_right": right_rgb.permute((0, 3, 1, 2)),
+                # "img_left": seg_left,
+                # "img_right": seg_right,
                 "expert_policy": teacher_policy_obs,
                 "critic": critic_obs,
                 "aux_info": aux_info,
