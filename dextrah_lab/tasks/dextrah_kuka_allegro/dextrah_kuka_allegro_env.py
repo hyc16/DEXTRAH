@@ -22,7 +22,7 @@ import torch.nn.functional as F
 from collections.abc import Sequence
 from scipy.spatial.transform import Rotation as R
 import random
-from pxr import Gf, UsdGeom, UsdShade, Sdf
+from pxr import Gf, UsdGeom, UsdShade, Sdf, Semantics
 
 import omni.usd
 import isaaclab.sim as sim_utils
@@ -65,6 +65,12 @@ from fabrics_sim.utils.utils import initialize_warp, capture_fabric
 from fabrics_sim.worlds.world_mesh_model import WorldMeshesModel
 from fabrics_sim.utils.path_utils import get_robot_urdf_path
 from fabrics_sim.taskmaps.robot_frame_origins_taskmap import RobotFrameOriginsTaskMap
+
+from ultralytics.models.sam.predict import SAM2Predictor
+import matplotlib
+
+import cv2
+matplotlib.use("TkAgg")   # 或 "QtAgg"
 
 class DextrahKukaAllegroEnv(DirectRLEnv):
     cfg: DextrahKukaAllegroEnvCfg
@@ -277,6 +283,669 @@ class DextrahKukaAllegroEnv(DirectRLEnv):
         #self.robot.write_joint_friction_to_sim(friction_coeff, self.actuated_dof_indices, None)
         self.robot.data.default_joint_friction_coeff = friction_coeff
 
+    # ===== SAM / image feature utils =====
+        # grid_sz:散点密度长宽
+        # margin：边缘距离，点不贴着边撒
+        # score_thresh：得分大于0.7才mask
+        # iou_thresh：去重阈值，删除重复mask，多点必然会有重复标定的物体
+    def _init_sam2_predictor(self):
+        """初始化并缓存 SAM2 predictor。
+
+        该函数采用延迟初始化方式：仅在第一次调用时真正创建 predictor。
+        如果 `self._sam2_predictor` 已经存在，则直接返回，避免重复加载模型。
+        初始化过程中会完成模型构建、`imgsz=1024` 的设置，以及 predictor
+        所需内部状态的准备，供后续特征提取和 prompt 分割流程复用。
+
+        Returns:
+            None
+        """
+        if hasattr(self, "_sam2_predictor") and self._sam2_predictor is not None:
+            return
+
+        predictor = SAM2Predictor(overrides={
+            "model": "sam2.1_l.pt",
+            "device": str(self.device),
+            "imgsz": 1024,
+            "mode": "predict",
+            "task": "segment",
+        })
+
+        predictor.setup_model(model=None, verbose=False)
+        predictor.args.imgsz = 1024
+        predictor.imgsz = (1024, 1024)
+        predictor.setup_source(None)
+
+        self._sam2_predictor = predictor
+
+    def _get_im_features_batched(self, imgs_bchw: torch.Tensor):
+        """对一批图像提取 SAM2 backbone 特征。
+
+        该函数将输入的 1024x1024 RGB 图像 batch 送入 SAM2 图像编码器，
+        并整理为后续 `_inference_features()` 可直接使用的特征字典格式。
+        SAM2 backbone 原始输出的特征排列并不是标准 BCHW，
+        这里会将其重排后返回，方便按 batch 中的单张图像继续做 prompt 分割。
+
+        Args:
+            imgs_bchw: 输入图像张量，形状为 [B, 3, 1024, 1024]，
+                通道顺序为 RGB，通常为 float32，位于当前计算设备上。
+
+        Returns:
+            一个字典，包含以下字段：
+                image_embed: 主图像特征，形状通常为 [B, 256, 64, 64]。
+                high_res_feats: 高分辨率特征列表，通常包含两个尺度：
+                    第一个元素形状约为 [B, 32, 256, 256]；
+                    第二个元素形状约为 [B, 64, 128, 128]。
+        """
+        self._init_sam2_predictor()
+        predictor = self._sam2_predictor
+
+        with torch.inference_mode():
+            backbone_out = predictor.model.forward_image(imgs_bchw)
+            _, vision_feats, _, _ = predictor.model._prepare_backbone_features(backbone_out)
+
+            if predictor.model.directly_add_no_mem_embed:
+                vision_feats[-1] = vision_feats[-1] + predictor.model.no_mem_embed
+
+            B = imgs_bchw.shape[0]
+            feats = []
+
+            for feat, feat_size in zip(vision_feats, predictor._bb_feat_sizes):
+                h, w = feat_size
+                # feat: [H*W, B, C] -> [B, C, H, W]
+                feat_bchw = feat.permute(1, 2, 0).contiguous().reshape(B, feat.shape[-1], h, w)
+                feats.append(feat_bchw)
+
+            return {
+                "image_embed": feats[-1],
+                "high_res_feats": feats[:-1],
+            }
+
+    def _build_grid_prompts(self, size=1024, grid_size=5, margin=64):
+        """构造均匀网格点提示。
+
+        该函数在 `[margin, size - margin]` 范围内均匀撒点，
+        生成一组前景点提示，供 SAM 自动分割使用。
+        输出的点坐标和标签格式与 SAM2 prompt 接口兼容。
+
+        Args:
+            size: SAM 输入图像的边长，默认值为 1024。
+            grid_size: 网格边长，总提示点数为 `grid_size * grid_size`。
+            margin: 距图像边界的安全边距，用于避免提示点过于贴边。
+
+        Returns:
+            points: 点坐标张量，形状为 [N, 1, 2]，其中 N 为总提示点数，
+                每个点的坐标格式为 [x, y]，坐标系基于 `size x size` 图像。
+            labels: 点标签张量，形状为 [N, 1]，全部为 1，
+                表示这些点都作为前景正样本提示。
+        """
+        xs = torch.linspace(margin, size - margin, grid_size, device=self.device)
+        ys = torch.linspace(margin, size - margin, grid_size, device=self.device)
+
+        pts = []
+        for y in ys:
+            for x in xs:
+                pts.append([x.item(), y.item()])
+
+        points = torch.tensor(pts, device=self.device, dtype=torch.float32).unsqueeze(1)  # [N,1,2]
+        labels = torch.ones((points.shape[0], 1), device=self.device, dtype=torch.int64)  # [N,1]
+        return points, labels
+
+    def _mask_iou(self, a: torch.Tensor, b: torch.Tensor):
+        """计算两个二值 mask 的 IoU。
+
+        该函数主要用于候选 mask 去重。
+
+        Args:
+            a: 第一个二值 mask，形状为 [H, W]，dtype 通常为 bool。
+            b: 第二个二值 mask，形状为 [H, W]，dtype 通常为 bool。
+
+        Returns:
+            两个 mask 的交并比 IoU，类型为 float。
+            当两个 mask 的并集为空时，返回 0.0。
+        """
+        inter = (a & b).sum().float()
+        union = (a | b).sum().float()
+        if union.item() == 0:
+            return 0.0
+        return (inter / union).item()
+
+    def _auto_segment_one_image_from_features(self,features,img_idx: int,grid_points: torch.Tensor,grid_labels: torch.Tensor,score_thresh: float = 0.7,iou_thresh: float = 0.85,):
+        """对 batch 中指定的一张图像执行自动网格点分割。
+
+        该函数会遍历给定的点提示，对 `img_idx` 对应图像逐点调用
+        SAM2 的 prompt inference，取每个点得分最高的候选 mask，
+        再根据分数阈值和 IoU 阈值进行筛选与去重。
+        对每个提示点只保留得分最高的候选结果，
+        并按照得分从高到低做重复过滤。
+
+        Args:
+            features: 由 `_get_im_features_batched()` 返回的 SAM 图像特征字典。
+            img_idx: 当前要处理的图像在 batch 中的索引。
+            grid_points: 提示点张量，形状为 [N, 1, 2]。
+            grid_labels: 提示点标签张量，形状为 [N, 1]。
+            score_thresh: 单个候选 mask 的最低保留分数阈值。
+            iou_thresh: 候选 mask 去重时使用的 IoU 阈值。
+
+        Returns:
+            kept_masks: 保留下来的 mask 列表，每个元素形状为 [H, W]，
+                dtype 为 bool。当前实现中通常为 [256, 256]。
+            kept_scores: 与 `kept_masks` 一一对应的分数列表。
+        """
+        predictor = self._sam2_predictor
+        candidates = []
+
+        with torch.inference_mode():
+            for p, l in zip(grid_points, grid_labels):
+                # p: [1,2] -> [1,1,2]
+                points = p.unsqueeze(0)  # [1,1,2]
+                labels = l.unsqueeze(0)  # [1,1]
+
+                pred_masks, pred_scores = predictor._inference_features(
+                    features,
+                    points=points,
+                    labels=labels,
+                    masks=None,
+                    multimask_output=True,
+                    img_idx=img_idx,
+                )
+
+                # 只取这个点最好的一个候选 mask
+                best_idx = int(torch.argmax(pred_scores).item())
+                best_score = float(pred_scores[best_idx].item())
+
+                if best_score < score_thresh:
+                    continue
+
+                best_mask = pred_masks[best_idx] > 0  # [256,256] bool
+                candidates.append((best_mask, best_score))
+
+        # 按 score 从高到低排序
+        candidates.sort(key=lambda x: x[1], reverse=True)
+
+        kept_masks = []
+        kept_scores = []
+
+        for mask, score in candidates:
+            duplicated = False
+            for existing in kept_masks:
+                if self._mask_iou(mask, existing) > iou_thresh:
+                    duplicated = True
+                    break
+            if not duplicated:
+                kept_masks.append(mask)
+                kept_scores.append(score)
+
+        return kept_masks, kept_scores
+
+    def _auto_segment_batch(self, imgs_sam: torch.Tensor, grid_size=5, score_thresh=0.7, iou_thresh=0.85):
+        """对一批图像执行基于网格点的自动分割。
+
+        该函数会先统一提取 batch 特征，再对 batch 中每张图分别执行
+        `_auto_segment_one_image_from_features()`，并将每张图的保留 mask
+        取逻辑并集，得到对应的 union mask。
+        如果某张图没有任何有效候选 mask，则其 union mask 为全零。
+
+        Args:
+            imgs_sam: 输入图像张量，形状为 [B, 3, 1024, 1024]。
+            grid_size: 自动分割所使用的网格边长，总提示点数为 `grid_size^2`。
+            score_thresh: 单个候选 mask 的最低保留分数阈值。
+            iou_thresh: 候选 mask 去重时的 IoU 阈值。
+
+        Returns:
+            union_masks: 每张图所有保留 mask 的并集，形状为 [B, 256, 256]，
+                dtype 为 bool。
+            all_kept_masks: 长度为 B 的列表，每个元素是该图像保留下来的
+                mask 列表。
+            all_kept_scores: 长度为 B 的列表，每个元素是对应图像的分数列表。
+        """
+        features = self._get_im_features_batched(imgs_sam)
+        grid_points, grid_labels = self._build_grid_prompts(size=1024, grid_size=grid_size, margin=64)
+
+        num_imgs = imgs_sam.shape[0]
+        union_masks = []
+        all_kept_masks = []
+        all_kept_scores = []
+
+        for img_idx in range(num_imgs):
+            kept_masks, kept_scores = self._auto_segment_one_image_from_features(
+                features,
+                img_idx=img_idx,
+                grid_points=grid_points,
+                grid_labels=grid_labels,
+                score_thresh=score_thresh,
+                iou_thresh=iou_thresh,
+            )
+
+            if len(kept_masks) == 0:
+                union_mask = torch.zeros((256, 256), device=self.device, dtype=torch.bool)
+            else:
+                union_mask = torch.zeros_like(kept_masks[0], dtype=torch.bool)
+                for m in kept_masks:
+                    union_mask |= m
+
+            union_masks.append(union_mask)
+            all_kept_masks.append(kept_masks)
+            all_kept_scores.append(kept_scores)
+
+        union_masks = torch.stack(union_masks, dim=0)  # [B,256,256]
+        return union_masks, all_kept_masks, all_kept_scores
+
+    # ===== high-level SAM pipeline =====
+
+    def _compute_sam_union_masks_from_stereo(self,left_rgb: torch.Tensor,right_rgb: torch.Tensor,grid_size: int = 8,score_thresh: float = 0.7,iou_thresh: float = 0.85,):
+        """对双目 RGB 图像执行 SAM 自动分割，并返回与原图对齐的 union mask。
+
+            该函数会先将左右相机图像从 [B, H, W, 3] 转为 [B, 3, H, W]，
+            再拼接成 [2B, 3, H, W] 统一送入 SAM 分割流程。
+            SAM 得到的低分辨率 mask 最终会被上采样回原始图像尺寸。
+            该函数只负责生成 mask，不负责做颜色叠加；
+            真正的图像高亮逻辑在 `_apply_mask_overlay_to_rgb_batch()` 中完成。
+
+            Args:
+                left_rgb: 左相机 RGB 图像，形状为 [B, H, W, 3]，数值范围通常为 [0, 1]。
+                right_rgb: 右相机 RGB 图像，形状为 [B, H, W, 3]，数值范围通常为 [0, 1]。
+                grid_size: 自动分割所使用的网格边长。
+                score_thresh: 单个候选 mask 的最低保留分数阈值。
+                iou_thresh: 候选 mask 去重时的 IoU 阈值。
+
+            Returns:
+                img_l: 转换通道顺序后的左图，形状为 [B, 3, H, W]。
+                img_r: 转换通道顺序后的右图，形状为 [B, 3, H, W]。
+                union_masks_up: 上采样回原图尺寸后的 union mask，形状为 [2B, H, W]，
+                    dtype 为 bool。前 B 张对应左图，后 B 张对应右图。
+                sam_meta: 调试和分析用的中间结果字典，包含 SAM 输入图像、
+                    低分辨率 union mask、各图保留的 mask 和分数等信息。
+            """
+        img_l = left_rgb.permute(0, 3, 1, 2).contiguous()
+        img_r = right_rgb.permute(0, 3, 1, 2).contiguous()
+        B, _, H_raw, W_raw = img_l.shape
+
+        imgs = torch.cat([img_l, img_r], dim=0)
+        imgs_sam = F.interpolate(
+            imgs, size=(1024, 1024), mode="bilinear", align_corners=False
+        ).contiguous()
+
+        union_masks_256, all_kept_masks, all_kept_scores = self._auto_segment_batch(
+            imgs_sam,
+            grid_size=grid_size,
+            score_thresh=score_thresh,
+            iou_thresh=iou_thresh,
+        )
+
+        union_masks_up = F.interpolate(
+            union_masks_256.unsqueeze(1).float(),
+            size=(H_raw, W_raw),
+            mode="nearest",
+        ).squeeze(1) > 0.5
+
+        sam_meta = {
+            "imgs_sam": imgs_sam,
+            "union_masks_256": union_masks_256,
+            "all_kept_masks": all_kept_masks,
+            "all_kept_scores": all_kept_scores,
+            "batch_size": B,
+            "raw_hw": (H_raw, W_raw),
+        }
+        return img_l, img_r, union_masks_up, sam_meta
+
+    def _apply_mask_overlay_to_rgb_batch(self,imgs_bchw: torch.Tensor,masks_bhw: torch.Tensor,fg_alpha: float = 0.6,fg_red_bias: float = 0.4,bg_scale: float | None = None,):
+        """将二值 mask 叠加到 RGB 图像 batch 上。
+
+        该函数会对 mask 内区域进行红色高亮，
+        并可选地对背景区域整体压暗，从而突出前景目标区域。
+        当前实现采用“红色增强 + 可选背景压暗”的方式构造结果，
+        既可用于调试可视化，也可直接作为策略网络的图像输入。
+
+        Args:
+            imgs_bchw: 输入 RGB 图像张量，形状为 [B, 3, H, W]，
+                数值范围通常为 [0, 1]。
+            masks_bhw: 二值 mask 张量，形状为 [B, H, W]，
+                True 表示前景区域。
+            fg_alpha: 前景区域原图颜色的保留比例。
+            fg_red_bias: 前景区域红通道的附加偏置。
+            bg_scale: 背景区域的压暗比例。若为 None，则背景保持原亮度。
+
+        Returns:
+            seg: 叠加后的 RGB 图像张量，形状为 [B, 3, H, W]，
+                数值范围被裁剪到 [0, 1]。
+        """
+        mask = masks_bhw.unsqueeze(1).float()
+        seg = imgs_bchw.clone()
+
+        if bg_scale is not None:
+            seg = seg * (mask + (1.0 - mask) * bg_scale)
+
+        seg[:, 0:1] = seg[:, 0:1] * (1.0 - mask) + (seg[:, 0:1] * fg_alpha + fg_red_bias) * mask
+        seg[:, 1:2] = seg[:, 1:2] * (1.0 - mask) + (seg[:, 1:2] * fg_alpha) * mask
+        seg[:, 2:3] = seg[:, 2:3] * (1.0 - mask) + (seg[:, 2:3] * fg_alpha) * mask
+
+        return torch.clamp(seg, 0.0, 1.0)
+
+    def _build_sam_augmented_stereo_obs(self,left_rgb: torch.Tensor,right_rgb: torch.Tensor,):
+        """构造带有 SAM 前景高亮效果的双目观测图像。
+
+        该函数是 stereo RGB -> SAM mask -> overlay 的高层封装入口。
+        内部会先生成左右图的 union mask，再分别叠加到左右 RGB 图像上，
+        最终得到可直接写入观测字典的 `seg_left` 和 `seg_right`。
+        如果后续需要替换 mask 生成策略，优先修改这个函数内部流程即可。
+
+        Args:
+            left_rgb: 左相机 RGB 图像，形状为 [B, H, W, 3]。
+            right_rgb: 右相机 RGB 图像，形状为 [B, H, W, 3]。
+
+        Returns:
+            seg_left: 左图的高亮结果，形状为 [B, 3, H, W]。
+            seg_right: 右图的高亮结果，形状为 [B, 3, H, W]。
+            extra: 调试和分析用的中间结果字典，包含原始 BCHW 图像、
+                左右 mask、union mask 以及 SAM 中间结果。
+        """
+        img_l, img_r, union_masks_up, sam_meta = self._compute_sam_union_masks_from_stereo(
+            left_rgb,
+            right_rgb,
+            grid_size=8,
+            score_thresh=0.7,
+            iou_thresh=0.85,
+        )
+
+        B = sam_meta["batch_size"]
+        mask_left = union_masks_up[:B]
+        mask_right = union_masks_up[B:]
+
+        seg_left = self._apply_mask_overlay_to_rgb_batch(img_l, mask_left)
+        seg_right = self._apply_mask_overlay_to_rgb_batch(img_r, mask_right)
+
+        extra = {
+            "img_l": img_l,
+            "img_r": img_r,
+            "mask_left": mask_left,
+            "mask_right": mask_right,
+            "union_masks_up": union_masks_up,
+            "sam_meta": sam_meta,
+        }
+        return seg_left, seg_right, extra
+
+    # ===== depth-prompt experimental pipeline =====
+
+    def _pick_prompt_points_from_depth(self,depth_2d: torch.Tensor | np.ndarray,num_points: int = 25,radius: int = 35,alpha: float = 0.8,):
+        """从深度图有效区域中选择一组分布较均匀的提示点。
+
+        该函数会先根据 `depth > 0` 构造有效像素区域，
+        再对有效区域做距离变换，使得离边界更远的区域得分更高。
+        随后通过“选最大值 + 局部软抑制”的方式，迭代得到一组分散的提示点。
+        该方法属于实验性 prompt 生成策略，
+        适合用于“仅在深度有效区域内撒点”的分割实验。
+
+        Args:
+            depth_2d: 单张深度图，形状为 [H, W]。
+                若为 torch.Tensor，则会先转为 numpy 处理。
+            num_points: 最多选取的提示点数量。
+            radius: 每次选点后局部抑制的作用半径。
+            alpha: 局部抑制强度，值越大表示越强地压低已选点周围区域分数。
+
+        Returns:
+            picked_points: 选出的提示点列表，每个元素格式为 (x, y)，
+                坐标单位为原图像素坐标。
+            debug_dict: 调试信息字典，包含以下字段：
+                depth_valid: 有效深度区域的二值图。
+                dist_map: 初始距离变换图。
+                dist_for_pick: 经过逐次选点抑制后的距离图。
+        """
+        if torch.is_tensor(depth_2d):
+            depth_valid = (depth_2d > 0).detach().cpu().numpy().astype(np.uint8) * 255
+        else:
+            depth_valid = (depth_2d > 0).astype(np.uint8) * 255
+
+        pad = 1
+        depth_valid_pad = cv2.copyMakeBorder(depth_valid, pad, pad, pad, pad,borderType=cv2.BORDER_CONSTANT,value=0)
+        dist_map_pad = cv2.distanceTransform(depth_valid_pad, cv2.DIST_L2, 5)
+        dist_map = dist_map_pad[pad:-pad, pad:-pad]
+
+        dist_for_pick = dist_map.copy()
+        picked_points = []
+        H, W = dist_for_pick.shape
+
+        for _ in range(num_points):
+            if dist_for_pick.max() <= 0:
+                break
+
+            max_idx = np.argmax(dist_for_pick)
+            y, x = np.unravel_index(max_idx, dist_for_pick.shape)
+            picked_points.append((x, y))
+
+            y0, y1 = max(0, y - radius), min(H, y + radius + 1)
+            x0, x1 = max(0, x - radius), min(W, x + radius + 1)
+
+            yy, xx = np.mgrid[y0:y1, x0:x1]
+            d = np.sqrt((yy - y) ** 2 + (xx - x) ** 2)
+            penalty = alpha * np.clip(1.0 - d / radius, 0.0, 1.0)
+
+            valid_patch = (depth_valid[y0:y1, x0:x1] > 0).astype(np.float32)
+            patch = dist_for_pick[y0:y1, x0:x1]
+            dist_for_pick[y0:y1, x0:x1] = patch * (1.0 - penalty * valid_patch)
+            dist_for_pick = np.clip(dist_for_pick, 0.0, None)
+
+        return picked_points, {
+            "depth_valid": depth_valid,
+            "dist_map": dist_map,
+            "dist_for_pick": dist_for_pick,
+        }
+
+    def _segment_one_image_from_prompt_points(self,img0_sam: torch.Tensor, picked_points: list[tuple[int, int]],src_hw: tuple[int, int],score_thresh: float = 0.7,iou_thresh: float = 0.85,):
+        """使用一组提示点对单张图像执行 SAM 分割。
+
+        该函数会将原图坐标系中的提示点映射到 1024x1024 的 SAM 输入空间，
+        然后基于这些点提示对单张图像进行分割，并将所有保留 mask 求逻辑并集。
+        如果 `picked_points` 为空，则直接返回全零 union mask。
+        当前返回的 mask 仍为 SAM 的低分辨率输出，如需与原图对齐，需要额外上采样。
+
+        Args:
+            img0_sam: 单张输入图像，形状为 [1, 3, 1024, 1024]。
+            picked_points: 原图坐标系下的提示点列表，每个元素格式为 (x, y)。
+            src_hw: 原图尺寸，格式为 (H, W)，用于将提示点映射到 1024 空间。
+            score_thresh: 单个候选 mask 的最低保留分数阈值。
+            iou_thresh: 候选 mask 去重时的 IoU 阈值。
+
+        Returns:
+            union_mask: 所有保留 mask 的逻辑并集，形状通常为 [256, 256]，
+                dtype 为 bool。
+            kept_masks: 保留下来的候选 mask 列表。
+            kept_scores: 与 `kept_masks` 对应的分数列表。
+        """
+        H0, W0 = src_hw
+        num_points = len(picked_points)
+
+        if num_points == 0:
+            union_mask = torch.zeros((256, 256), device=self.device, dtype=torch.bool)
+            return union_mask, [], []
+
+        scale_x = 1024.0 / W0
+        scale_y = 1024.0 / H0
+        pts_1024 = [[x * scale_x, y * scale_y] for (x, y) in picked_points]
+
+        grid_points = torch.tensor(
+            pts_1024, device=self.device, dtype=torch.float32
+        ).unsqueeze(1)
+        grid_labels = torch.ones(
+            (num_points, 1), device=self.device, dtype=torch.int64
+        )
+
+        features0 = self._get_im_features_batched(img0_sam)
+
+        kept_masks, kept_scores = self._auto_segment_one_image_from_features(
+            features0,
+            img_idx=0,
+            grid_points=grid_points,
+            grid_labels=grid_labels,
+            score_thresh=score_thresh,
+            iou_thresh=iou_thresh,
+        )
+
+        if len(kept_masks) == 0:
+            union_mask = torch.zeros((256, 256), device=self.device, dtype=torch.bool)
+        else:
+            union_mask = torch.zeros_like(kept_masks[0], dtype=torch.bool)
+            for m in kept_masks:
+                union_mask |= m
+
+        return union_mask, kept_masks, kept_scores
+
+    # ===== debug visualization =====
+    def _debug_show_sam_overlay(self,rgb_chw: torch.Tensor,mask_hw: torch.Tensor,grid_points_1024: torch.Tensor | None = None,win_name: str = "SAM2 AutoSeg Debug",):
+        """显示单张图像与 SAM mask 的叠加结果。
+
+        该函数会将输入图像转换为 OpenCV 可显示格式，
+        对前景区域进行红色高亮，并可选地绘制提示点位置，
+        用于直观检查 mask 质量和 prompt 分布。
+        该函数仅用于调试显示，不参与训练或观测构造逻辑。
+
+        Args:
+            rgb_chw: 单张 RGB 图像，形状为 [3, H, W]，数值范围通常为 [0, 1]。
+            mask_hw: 单张二值 mask，形状为 [H, W]。
+            grid_points_1024: 可选的提示点张量，形状为 [N, 1, 2]，
+                坐标基于 1024x1024 图像空间。
+            win_name: OpenCV 显示窗口名称。
+
+        Returns:
+            None。
+        """
+        rgb0 = rgb_chw.permute(1, 2, 0).detach().cpu().numpy()
+        mask0 = mask_hw.detach().cpu().numpy()
+
+        overlay = rgb0.copy()
+        mask_bool = mask0 > 0
+
+        bg_scale = 0.25
+        overlay[~mask_bool] = overlay[~mask_bool] * bg_scale
+        overlay = np.clip(overlay, 0.0, 1.0)
+
+        overlay[mask_bool, 0] = overlay[mask_bool, 0] * 0.6 + 0.4
+        overlay[mask_bool, 1] = overlay[mask_bool, 1] * 0.6
+        overlay[mask_bool, 2] = overlay[mask_bool, 2] * 0.6
+        overlay = np.clip(overlay, 0.0, 1.0)
+
+        vis_bgr = (overlay[..., ::-1] * 255).astype(np.uint8)
+
+        if grid_points_1024 is not None:
+            pts = grid_points_1024.squeeze(1).detach().cpu().numpy()
+            scale_x = mask0.shape[1] / 1024.0
+            scale_y = mask0.shape[0] / 1024.0
+            for p in pts:
+                x = int(round(p[0] * scale_x))
+                y = int(round(p[1] * scale_y))
+                cv2.circle(vis_bgr, (x, y), 4, (0, 255, 0), -1)
+
+        cv2.imshow(win_name, vis_bgr)
+        cv2.waitKey(1)
+
+    def _debug_show_depth_prompt_pipeline(self,depth_valid: np.ndarray,dist_map: np.ndarray,dist_for_pick: np.ndarray,picked_points: list[tuple[int, int]],union_mask_256: torch.Tensor | np.ndarray | None = None,):
+        """显示深度提示点生成与 SAM 分割的中间结果。
+
+        该函数会将深度有效区域、原始距离变换图、抑制后的距离图、
+        以及可选的 SAM union mask 依次显示出来，并在图上标出已选提示点。
+        该函数仅用于调试“深度有效区域撒点 + SAM”实验流程，
+        不参与训练主逻辑。
+
+        Args:
+            depth_valid: 有效深度区域二值图，形状为 [H, W]。
+            dist_map: 初始距离变换图，形状为 [H, W]。
+            dist_for_pick: 经过逐次选点抑制后的距离图，形状为 [H, W]。
+            picked_points: 选中的提示点列表，每个元素格式为 (x, y)。
+            union_mask_256: 可选的 SAM 低分辨率 union mask，形状通常为 [256, 256]。
+
+        Returns:
+            None。
+        """
+        depth_vis = depth_valid.copy()
+
+        if dist_map.max() > 0:
+            dist_vis = (dist_map / dist_map.max() * 255).astype(np.uint8)
+        else:
+            dist_vis = np.zeros_like(depth_valid, dtype=np.uint8)
+
+        if dist_for_pick.max() > 0:
+            dist_vis_after = (dist_for_pick / dist_for_pick.max() * 255).astype(np.uint8)
+        else:
+            dist_vis_after = np.zeros_like(depth_valid, dtype=np.uint8)
+
+        for (x, y) in picked_points:
+            cv2.circle(depth_vis, (x, y), 4, 0, -1)
+            cv2.circle(dist_vis, (x, y), 4, 0, -1)
+            cv2.circle(dist_vis_after, (x, y), 4, 0, -1)
+
+        cv2.imshow("Depth Valid Mask", depth_vis)
+        cv2.imshow("Depth Distance Map", dist_vis)
+        cv2.imshow("Depth Distance Map After Suppression", dist_vis_after)
+
+        if union_mask_256 is not None:
+            if torch.is_tensor(union_mask_256):
+                mask_vis = union_mask_256.detach().cpu().numpy().astype(np.uint8) * 255
+            else:
+                mask_vis = union_mask_256.astype(np.uint8) * 255
+            cv2.imshow("SAM Mask From Depth Points", mask_vis)
+
+        cv2.waitKey(1)
+
+    def _debug_show_semantic_segmentation(self, env_idx: int = 0):
+        """显示 Isaac Lab / TiledCamera 输出的语义分割图像。
+
+        该函数用于对比 Isaac Lab 原生语义分割结果
+        与当前 SAM 分割结果之间的差异。
+        该函数仅用于调试显示，不参与训练或观测构造逻辑。
+
+        Args:
+            env_idx: 要显示的环境索引。
+
+        Returns:
+            None。
+        """
+        seg = self._tiled_camera.data.output["semantic_segmentation"]
+        img = seg[env_idx, ..., :3].cpu().numpy()
+        img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        cv2.imshow("semantic_segmentation", img_bgr)
+        cv2.waitKey(1)
+
+    def _debug_show_policy_obs_pairs(self,seg_left: torch.Tensor,seg_right: torch.Tensor,max_show: int = 4,):
+        """显示最终送入策略网络的左右图像对。
+
+        该函数会将 batch 中前若干个环境的左右观测图像转换为 OpenCV 可显示格式，
+        按左右拼接后逐个窗口显示，用于检查策略实际接收到的视觉输入是否正确。
+        该函数仅用于调试显示，不参与训练或观测构造逻辑。
+
+        Args:
+            seg_left: 左图 batch，形状为 [B, 3, H, W]，
+                通常为经过 SAM mask 叠加后的观测图像。
+            seg_right: 右图 batch，形状为 [B, 3, H, W]，
+                通常为经过 SAM mask 叠加后的观测图像。
+            max_show: 最多显示多少个环境。
+
+        Returns:
+            None。
+        """
+        left_np = seg_left.detach().permute(0, 2, 3, 1).cpu().numpy()
+        right_np = seg_right.detach().permute(0, 2, 3, 1).cpu().numpy()
+
+        left_np = (left_np * 255).astype(np.uint8)
+        right_np = (right_np * 255).astype(np.uint8)
+
+        left_np = np.ascontiguousarray(left_np[..., ::-1])
+        right_np = np.ascontiguousarray(right_np[..., ::-1])
+
+        num_show = min(left_np.shape[0], max_show)
+
+        for i in range(num_show):
+            pair = np.concatenate([left_np[i], right_np[i]], axis=1)
+            pair = np.ascontiguousarray(pair)
+
+            cv2.putText(pair, f"env {i} left", (10, 25),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            w = left_np[i].shape[1]
+            cv2.putText(pair, "right", (w + 10, 25),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+            cv2.imshow(f"seg_env_{i}", pair)
+
+        cv2.waitKey(1)
+
     def find_num_unique_objects(self, objects_dir):
         module_path = os.path.dirname(__file__)
         root_path = os.path.dirname(os.path.dirname(module_path))
@@ -397,6 +1066,16 @@ class DextrahKukaAllegroEnv(DirectRLEnv):
         pos = pos + self.scene.env_origins
         self.gt_pos_markers.visualize(pos, self.object_rot)
 
+    def _set_semantic_label(self, prim_path: str, label: str):
+        stage = omni.usd.get_context().get_stage()
+        prim = stage.GetPrimAtPath(prim_path)
+        if not prim.IsValid():
+            print(f"[semantic] invalid prim: {prim_path}")
+            return
+        api = Semantics.SemanticsAPI.Apply(prim, "Semantics")
+        api.CreateSemanticTypeAttr().Set("class")
+        api.CreateSemanticDataAttr().Set(label)
+
     def _setup_scene(self):
         # add robot, objects
         # TODO: add goal objects?
@@ -424,6 +1103,11 @@ class DextrahKukaAllegroEnv(DirectRLEnv):
         # Create the objects for grasping
         # self._setup_metropolis_objects()
         self._setup_objects()
+        # semantic labels
+        for i in range(self.num_envs):
+            self._set_semantic_label(f"/World/envs/env_{i}/Robot", "robot")
+            self._set_semantic_label(f"/World/envs/env_{i}/table", "table")
+
         if self.cfg.distillation:
             import omni.replicator.core as rep
             rep.settings.set_render_rtx_realtime(antialiasing="DLAA")
@@ -578,6 +1262,9 @@ class DextrahKukaAllegroEnv(DirectRLEnv):
             )
             # add object to scene
             object_for_grasping = RigidObject(object_cfg)
+
+############ 给当前抓取物体打 semantic label
+            self._set_semantic_label(prim_path, "object")
 
             # remove baseLink
             set_prim_attribute_value(
@@ -827,6 +1514,11 @@ class DextrahKukaAllegroEnv(DirectRLEnv):
             obj_uv_right[:, 0] /= self.cfg.img_width
             obj_uv_right[:, 1] /= self.cfg.img_height
 
+############   SAM处理
+            seg_left, seg_right, sam_extra = self._build_sam_augmented_stereo_obs(left_rgb,right_rgb,)
+            self._debug_show_sam_overlay(sam_extra["img_l"][0],sam_extra["mask_left"][0],)
+            self._debug_show_semantic_segmentation(env_idx=0)
+
             aux_info = {
                 "object_pos": self.object_pos,#物体位置
                 "left_img_depth": left_depth.permute((0, 3, 1, 2)),#左相机深度图
@@ -840,8 +1532,10 @@ class DextrahKukaAllegroEnv(DirectRLEnv):
                 "depth_right": right_depth.permute((0, 3, 1, 2)),#右相机深度图
                 "mask_left": left_mask.permute((0, 3, 1, 2)),#深度掩码图
                 "mask_right": right_mask.permute((0, 3, 1, 2)),
-                "img_left": left_rgb.permute((0, 3, 1, 2)),#原始左右相机 RGB 图
-                "img_right": right_rgb.permute((0, 3, 1, 2)),
+                # "img_left": left_rgb.permute((0, 3, 1, 2)),#原始左右相机 RGB 图
+                # "img_right": right_rgb.permute((0, 3, 1, 2)),
+                "img_left": seg_left,
+                "img_right": seg_right,
                 "expert_policy": teacher_policy_obs,
                 "critic": critic_obs,
                 "aux_info": aux_info,
@@ -1598,6 +2292,120 @@ class DextrahKukaAllegroEnv(DirectRLEnv):
 
         # Write wrench data to sim
         self.object.write_data_to_sim()
+
+        #padding图像
+
+    def pad_to_stride(self,x, stride=32, mode="replicate"):
+        # x: BCHW
+        b, c, h, w = x.shape
+        pad_h = (stride - h % stride) % stride
+        pad_w = (stride - w % stride) % stride
+        x_pad = F.pad(x, (0, pad_w, 0, pad_h), mode=mode)  # (left,right,top,bottom)
+        return x_pad, (h, w), (pad_h, pad_w)
+
+    def unpad_bchw(self,x, hw):
+        """x: [B,C,Hpad,Wpad] -> [B,C,H0,W0]"""
+        H0, W0 = hw
+        return x[..., :H0, :W0]
+
+    def unpad_hw(self,x, hw):
+        """x: [Hpad,Wpad] or [Hpad,Wpad,3] -> crop to [H0,W0,(...)]"""
+        H0, W0 = hw
+        return x[:H0, :W0, ...]
+
+    def fastsam_pure_seg_batch(self, results_list, orig_hw=None, background=(0, 0, 0), seed=0):
+        """
+        results_list: List[ultralytics.engine.results.Results], len=B
+        orig_hw: (H0,W0) 用于裁回原图大小（推荐传入）
+        return: seg_bhwc uint8, shape [B,H,W,3]
+        """
+        B = len(results_list)
+        if B == 0:
+            raise ValueError("Empty results_list")
+
+        # 以第一张的 device 为准（mask tensor 在 GPU 上）
+        device = None
+        for r in results_list:
+            if r.masks is not None and r.masks.data is not None:
+                device = r.masks.data.device
+                break
+        if device is None:
+            device = torch.device("cpu")
+
+        # 目标输出尺寸
+        if orig_hw is not None:
+            H, W = orig_hw
+        else:
+            H, W = results_list[0].orig_shape  # 注意：如果输入是 padded tensor，这里会是 padded 尺寸
+
+        seg = torch.zeros((B, H, W, 3), dtype=torch.uint8, device=device)
+        seg[..., 0] = background[0]
+        seg[..., 1] = background[1]
+        seg[..., 2] = background[2]
+
+        g = torch.Generator(device="cpu").manual_seed(seed)
+
+        for i, r in enumerate(results_list):
+            if r.masks is None or r.masks.data is None or r.masks.data.numel() == 0:
+                continue
+
+            m = (r.masks.data > 0)  # [N, Hpad, Wpad] bool
+            m = m[:, :H, :W]  # 裁回目标 H,W（去 pad）
+
+            N = m.shape[0]
+            # 每张图给 N 个实例生成颜色（在 CPU 上生成再搬到 device）
+            colors = torch.randint(0, 256, (N, 3), generator=g, dtype=torch.uint8).to(device)
+
+            # 按实例涂色：后面的实例覆盖前面的重叠区域
+            for k in range(N):
+                seg[i][m[k]] = colors[k]
+
+        seg_bchw = seg.permute(0, 3, 1, 2).contiguous()  # [B,3,H,W]
+        return seg_bchw
+
+    def fastsam_union_mask_b1hw(self,fastsam_model, imgs_bchw, conf=0.6, iou=0.8, imgsz=None):
+        """
+        imgs_bchw: [B,3,H,W] float in [0,1]
+        return: [B,1,H,W] float {0,1} (已裁掉pad)
+        """
+        B, _, H, W = imgs_bchw.shape
+
+        # pad
+        imgs_pad, (H0, W0), _ = self.pad_to_stride32(imgs_bchw, stride=32, mode="replicate")
+
+        # 推理
+        results = fastsam_model(imgs_pad, conf=conf, iou=iou, retina_masks=True, imgsz=imgsz)
+
+        # 组 mask
+        out = torch.zeros((B, 1, H0, W0), device=imgs_bchw.device, dtype=torch.float32)
+        for i, r in enumerate(results):
+            if r.masks is None:
+                continue
+            m = (r.masks.data > 0)  # [N,Hpad,Wpad]
+            m = m[:, :H0, :W0]  # 裁掉白边
+            union = m.any(dim=0)  # [H,W]
+            out[i, 0] = union.float()
+
+        return out
+
+    def _quat_wxyz_to_rotmat(self, q: torch.Tensor) -> torch.Tensor:
+        # q: (N,4) wxyz
+        w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+        ww, xx, yy, zz = w * w, x * x, y * y, z * z
+        wx, wy, wz = w * x, w * y, w * z
+        xy, xz, yz = x * y, x * z, y * z
+
+        R = torch.empty((q.shape[0], 3, 3), device=q.device, dtype=q.dtype)
+        R[:, 0, 0] = ww + xx - yy - zz
+        R[:, 0, 1] = 2 * (xy - wz)
+        R[:, 0, 2] = 2 * (xz + wy)
+        R[:, 1, 0] = 2 * (xy + wz)
+        R[:, 1, 1] = ww - xx + yy - zz
+        R[:, 1, 2] = 2 * (yz - wx)
+        R[:, 2, 0] = 2 * (xz - wy)
+        R[:, 2, 1] = 2 * (yz + wx)
+        R[:, 2, 2] = ww - xx - yy + zz
+        return R
 
     @property
     @functools.lru_cache()

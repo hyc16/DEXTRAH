@@ -267,7 +267,8 @@ class DextrahKukaAllegroEnvCfg(DirectRLEnvCfg):
     tiled_camera: TiledCameraCfg = TiledCameraCfg(
         prim_path="/World/envs/env_.*/Camera",
         offset=TiledCameraCfg.OffsetCfg(pos=camera_pos, rot=camera_rot, convention="ros"),
-        data_types=["rgb", "depth"],
+        data_types=["rgb", "depth", "semantic_segmentation"],
+        colorize_semantic_segmentation=True,   # 直接输出彩色语义图\
         spawn=sim_utils.PinholeCameraCfg(
             focal_length=focal_length, focus_distance=400.0, horizontal_aperture=horizontal_aperture, clipping_range=(0.01, 2.)
         ),
@@ -444,7 +445,7 @@ class DextrahKukaAllegroEnvCfg(DirectRLEnvCfg):
     cam_matrix[1, 1] = 2.9947157
     cam_matrix[2, 3] = -1.
     cam_matrix[3, 2] = 1.e-3
-    d_min = 0.5
+    d_min = 0.0
     d_max = 1.3
     depth_randomization_cfg_dict = {
         # Dropout and random noise blob parameters
