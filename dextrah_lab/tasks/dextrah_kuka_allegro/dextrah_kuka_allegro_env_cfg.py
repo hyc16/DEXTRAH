@@ -268,7 +268,7 @@ class DextrahKukaAllegroEnvCfg(DirectRLEnvCfg):
         prim_path="/World/envs/env_.*/Camera",
         offset=TiledCameraCfg.OffsetCfg(pos=camera_pos, rot=camera_rot, convention="ros"),
         data_types=["rgb", "depth", "semantic_segmentation"],
-        colorize_semantic_segmentation=True,   # 直接输出彩色语义图\
+        colorize_semantic_segmentation=False,   # True输出彩色语义图\False输出单通道黑白
         spawn=sim_utils.PinholeCameraCfg(
             focal_length=focal_length, focus_distance=400.0, horizontal_aperture=horizontal_aperture, clipping_range=(0.01, 2.)
         ),
